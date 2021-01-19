@@ -7,19 +7,21 @@ This repository is primarily for development of support for Oculus Rift CV1 and 
 
 ### Oculus Rift CV1
 
-2020-09-11 - Upstream OpenHMD has support for 3DOF tracking of the headset and hand controllers.
+2021-01-19 - Positional tracking support is ongoing in this repo
 
-Development toward full positional tracking is happening here in the https://github.com/thaytan/OpenHMD/tree/rift-correspondence-search branch. This branch has the latest code for ab-initio matching of observed LEDs to tracked devices.
+Development toward full positional tracking is happening here in the https://github.com/thaytan/OpenHMD/tree/rift-kalman-filter branch. This branch has the latest code for acquiring device positions from LED matching and tracking over time.
 
-My current focus is on rearragnging the computer vision to:
- * Capture and do initial analysis in a thread per oculus sensor to check for good tracking.
- * Offload frames to a dedicated computer vision thread if tracking is lost.
- * Initialisation of the relative poses of each sensor on startup, and detection of cameras being moved.
- * Full Kalman filtering of the position and orientation, extracting biases.
+My current focus is on improving the computer vision to:
+  * Improve device acquisition and matching using IMU orientation data, particularly for controllers
+  * Reduce jitter in tracking
+  * Improve tracking under difficult conditions - when device LEDs are heavily occluded or start to merge into one tracking blob at a distance or sharp angles to the camera.
+  * More testing of multiple camera setups.
+
+There are also various issues to resolve - spurious startup errors with USB transactions, and occasional watchdog timeouts that lead to a black screen.
 
 ### Oculus Rift S
 
-2020-06-01 - For Rift S, current development is focussed on reverse engineering the headset USB protocol and firmware details. There is a preliminary driver that supports 3DOF for the headset only, with no distortion in https://github.com/thaytan/OpenHMD/tree/dev-rift-s
+2021-01-19 - For Rift S, upstream OpenHMD has a working 3DOF driver. I plan to work on positional support after CV1 tracking is in a functional state, unless someone else tackles it first.
 
 ## License
 OpenHMD is released under the permissive Boost Software License (see LICENSE for more information), to make sure it can be linked and distributed with both free and non-free software. While it doesn't require contribution from the users, it is still very appreciated.
