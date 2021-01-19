@@ -19,6 +19,8 @@ My current focus is on improving the computer vision to:
 
 There are also various issues to resolve - spurious startup errors with USB transactions, and occasional watchdog timeouts that lead to a black screen.
 
+Joey made a demo video of current tracking status with a DK2 at https://www.youtube.com/watch?v=3AdmS3vy7ZE
+
 ### Oculus Rift S
 
 2021-01-19 - For Rift S, upstream OpenHMD has a working 3DOF driver. I plan to work on positional support after CV1 tracking is in a functional state, unless someone else tackles it first.
