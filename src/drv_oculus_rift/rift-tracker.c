@@ -94,6 +94,7 @@ struct rift_tracked_device_imu_observation {
 
 struct rift_tracker_pose_report {
 		bool report_used; /* TRUE if this report has been integrated */
+		bool orient_used; /* TRUE if the report's orientation was applied */
 		posef pose;
 		rift_pose_metrics score;
 		float obs_scale; /* confidence tier the report was integrated with */
@@ -152,6 +153,10 @@ struct rift_tracked_device_priv {
 	uint64_t last_observed_orient_ts;
 	uint64_t last_observed_pose_ts;
 	posef last_observed_pose;
+
+	/* same-exposure merge telemetry */
+	int merge_count;
+	double merge_shift_accum;
 
 	uint64_t last_acquired_pose_lock_ts;
 
@@ -1262,8 +1267,17 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			 * disagreement). Instead, correct toward the confidence-weighted
 			 * mean position of ALL of this exposure's used observations: the
 			 * cycle then ends at the same midpoint regardless of order.
-			 * Position only — the wander is positional, and orientation
-			 * keeps its established overwrite semantics. */
+			 *
+			 * Orientation merges too, but ONLY across same-exposure reports
+			 * whose orientation was actually applied (orient_used): the two
+			 * simultaneous verified solutions can disagree by degrees on
+			 * sparse LED geometry (measured 4.7 deg constant on a Touch
+			 * ring, position dragged ~86 mm through the lever arm), and
+			 * overwrite semantics alternate the fused orientation between
+			 * them with arrival order. This is unlike the earlier
+			 * cross-EXPOSURE orientation blending that caused output thrash:
+			 * nothing persists past the exposure, and a bad orientation is
+			 * still superseded by the next exposure's fix. */
 			posef fusion_target = imu_pose;
 			float fusion_scale = obs_scale;
 			bool merged = false;
@@ -1272,6 +1286,8 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 				float w_sum = 1.0f / (obs_scale * obs_scale);
 				vec3f p_acc = imu_pose.pos;
 				ovec3f_multiply_scalar(&p_acc, w_sum, &p_acc);
+				float qw_sum = update_orientation ? 1.0f / (obs_scale * obs_scale) : 0.0f;
+				quatf q_acc = imu_pose.orient;
 				int i;
 
 				for (i = 0; i < slot->n_pose_reports; i++) {
@@ -1284,10 +1300,18 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 					ovec3f_add(&p_acc, &p, &p_acc);
 					w_sum += w;
 					merged = true;
+
+					if (update_orientation && prev->orient_used) {
+						/* incremental weighted quaternion mean */
+						oquatf_slerp(w / (qw_sum + w), &q_acc, &prev->pose.orient, true, &q_acc);
+						oquatf_normalize_me(&q_acc);
+						qw_sum += w;
+					}
 				}
 
 				if (merged) {
 					ovec3f_multiply_scalar(&p_acc, 1.0f / w_sum, &fusion_target.pos);
+					fusion_target.orient = q_acc;
 					fusion_scale = 1.0f / sqrtf(w_sum);
 
 					vec3f merge_shift;
@@ -1295,6 +1319,17 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 					LOGD("dev %d slot %d: merged %d same-exposure obs, shift %f %f %f",
 						dev->base.id, slot->slot_id, slot->n_used_reports + 1,
 						merge_shift.x, merge_shift.y, merge_shift.z);
+
+					/* Rate-limited merge telemetry (per device) */
+					dev->merge_count++;
+					dev->merge_shift_accum += ovec3f_get_length(&merge_shift);
+					if (dev->merge_count % 300 == 0) {
+						LOGI("dev %d: %d same-exposure merges, mean |shift| %.1f mm (orient merged: %s)",
+							dev->base.id, dev->merge_count,
+							1000.0 * dev->merge_shift_accum / 300.0,
+							(update_orientation && qw_sum > 1.0f / (obs_scale * obs_scale)) ? "yes" : "no");
+						dev->merge_shift_accum = 0;
+					}
 				}
 			}
 
@@ -1343,6 +1378,7 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			rift_tracker_pose_report *report = slot->pose_reports + slot->n_pose_reports;
 
 			report->report_used = update_position;
+			report->orient_used = update_position && update_orientation;
 			/* store the RAW observation (not the merged target) so later
 			 * same-exposure merges weight original measurements, and the
 			 * per-sensor confidence it was integrated with */
