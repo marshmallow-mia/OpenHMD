@@ -340,6 +340,24 @@ static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsig
 	}
 }
 
+static uint64_t touch_imu_latency_ns(void)
+{
+	static int64_t ns = -1;
+	if (ns == -1) {
+		const char *e = getenv("OHMD_RIFT_TOUCH_IMU_LATENCY_MS");
+		/* Empirically tuned on-rig (2026-07-12): 10 ms left most of the
+		 * motion trailing in place; 25 ms cut fast-motion error 4-6x
+		 * (p90 ~100 -> ~20 mm); 35 ms overshot and destabilized. */
+		double ms = 25.0;
+		if (e && e[0])
+			ms = atof(e);
+		if (ms < 0.0 || ms > 50.0)
+			ms = 25.0;
+		ns = (int64_t)(ms * 1e6);
+	}
+	return (uint64_t)ns;
+}
+
 static void dump_controller_calibration(rift_touch_controller_t *touch)
 {
 	rift_touch_calibration *c = &touch->calibration;
@@ -433,6 +451,15 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 
 	uint32_t device_ts = msg->touch.timestamp - dt;
 	local_ts -= TICK_US_TO_NS(dt);
+
+	/* Touch IMU samples reach us over the radio (controller TDMA slot ->
+	 * HMD relay -> USB), so stamping them with arrival time makes the
+	 * controller clock-mapping ~10 ms late relative to the HMD-timed
+	 * camera exposures. Measured on this rig: fusion trails the optics
+	 * by v * ~8-17 ms during hand motion (40-110 mm at speed). Shift the
+	 * local timestamps earlier to compensate; tune/disable with
+	 * OHMD_RIFT_TOUCH_IMU_LATENCY_MS (default 10, 0 = off). */
+	local_ts -= touch_imu_latency_ns();
 
 	const double dt_s = 1e-6 * dt;
 	vec3f raw_accel = {{

@@ -36,5 +36,6 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 void rift_tracked_device_frame_release (rift_tracked_device *dev_base, rift_tracker_exposure_info *info);
 
 void rift_tracker_update_sensor_pose(rift_tracker_ctx *tracker_ctx, rift_sensor_ctx *sensor, posef *new_pose);
+void rift_tracker_extrinsic_refine_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor);
 
 #endif

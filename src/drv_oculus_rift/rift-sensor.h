@@ -81,5 +81,6 @@ bool rift_sensor_add_device (rift_sensor_ctx *ctx, rift_tracked_device *device);
 bool rift_sensor_start(rift_sensor_ctx *sensor);
 
 void rift_sensor_set_pose(rift_sensor_ctx *sensor, posef *camera_pose);
+void rift_sensor_get_pose(rift_sensor_ctx *sensor, posef *camera_pose);
 
 #endif

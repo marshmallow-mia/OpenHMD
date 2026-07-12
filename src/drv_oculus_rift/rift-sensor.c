@@ -677,6 +677,10 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	bool ret = rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
 	       score, obj_world_pose, sensor_ctx->serial_no);
 
+	/* Online extrinsic refinement: apply any ripe correction for THIS
+	 * sensor from its own thread (no locks held here) */
+	rift_tracker_extrinsic_refine_apply(sensor_ctx->tracker, sensor_ctx);
+
 	if (ret) {
 		/* If this pose was accepted by the tracker, transfer these blob labels to the blobwatch object */
 		ohmd_lock_mutex(sensor_ctx->sensor_lock);
@@ -716,4 +720,11 @@ void rift_sensor_set_pose(rift_sensor_ctx *sensor, posef *camera_pose)
 	    sensor->id,
 	    camera_pose->orient.x, camera_pose->orient.y, camera_pose->orient.z, camera_pose->orient.w,
 	    camera_pose->pos.x, camera_pose->pos.y, camera_pose->pos.z);
+}
+
+void rift_sensor_get_pose(rift_sensor_ctx *sensor, posef *camera_pose)
+{
+	ohmd_lock_mutex (sensor->sensor_lock);
+	*camera_pose = sensor->pf.camera_pose;
+	ohmd_unlock_mutex (sensor->sensor_lock);
 }
