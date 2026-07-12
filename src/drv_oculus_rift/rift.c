@@ -209,6 +209,61 @@ static void set_coordinate_frame(rift_hmd_t* priv, rift_coordinate_frame coordfr
 	}
 }
 
+/* How to apply the factory IMU calibration (matrix M, offset b) to raw
+ * samples. The offsets are biases measured at the factory: the flash
+ * gyro_offset matches the raw rest-bias on real hardware, and the Oculus
+ * runtime removes (not adds) them — see windows-touch-protocol.md §1.
+ * Historically this driver ADDED the offsets, doubling the bias (~0.5 deg/s
+ * gyro, and 2x|b| = up to ~1 m/s^2 accel = degrees of gravity tilt on Touch).
+ *
+ * OHMD_RIFT_CALIB_OFFSET selects, for A/B testing:
+ *   chip  (default): cal = M @ (raw - b)   offset in sensor chip frame
+ *   model:           cal = M @ raw - b     offset in device model frame
+ *   add:             cal = M @ raw + b     legacy behaviour
+ * chip vs model only differs where M is far from identity (the Touch axis
+ * permutation); for the HMD they are equivalent. */
+enum rift_calib_offset_mode {
+	RIFT_CALIB_OFFSET_CHIP = 0,
+	RIFT_CALIB_OFFSET_MODEL,
+	RIFT_CALIB_OFFSET_ADD,
+};
+
+static enum rift_calib_offset_mode calib_offset_mode(void)
+{
+	static int mode = -1;
+	if (mode == -1) {
+		const char *e = getenv("OHMD_RIFT_CALIB_OFFSET");
+		if (e && strcmp(e, "add") == 0)
+			mode = RIFT_CALIB_OFFSET_ADD;
+		else if (e && strcmp(e, "model") == 0)
+			mode = RIFT_CALIB_OFFSET_MODEL;
+		else
+			mode = RIFT_CALIB_OFFSET_CHIP;
+	}
+	return mode;
+}
+
+static void apply_imu_calibration(const float mat[3][3], const vec3f *offset,
+	const vec3f *raw, vec3f *out)
+{
+	vec3f tmp;
+
+	switch (calib_offset_mode()) {
+	case RIFT_CALIB_OFFSET_CHIP:
+		ovec3f_subtract(raw, offset, &tmp);
+		ovec3f_multiply_mat3x3(&tmp, mat, out);
+		break;
+	case RIFT_CALIB_OFFSET_MODEL:
+		ovec3f_multiply_mat3x3(raw, mat, out);
+		ovec3f_subtract(out, offset, out);
+		break;
+	default: /* legacy add-after-matrix */
+		ovec3f_multiply_mat3x3(raw, mat, out);
+		ovec3f_add(out, offset, out);
+		break;
+	}
+}
+
 static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsigned char* buffer, int size)
 {
 	if (buffer[0] == RIFT_IRQ_SENSORS_DK1
@@ -260,12 +315,10 @@ static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsig
 
 		/* If the rift isn't applying calibration, we should */
 		if (!(priv->sensor_config.flags & RIFT_SCF_USE_CALIBRATION)) {
-				/* Apply the rotation matrix first, and then add the provided factory offsets */
-				ovec3f_multiply_mat3x3(&raw_gyro, priv->imu_calibration.gyro_matrix, &gyro);
-				ovec3f_add(&gyro, &priv->imu_calibration.gyro_offset, &gyro);
-
-				ovec3f_multiply_mat3x3(&raw_accel, priv->imu_calibration.accel_matrix, &accel);
-				ovec3f_add(&accel, &priv->imu_calibration.accel_offset, &accel);
+				apply_imu_calibration(priv->imu_calibration.gyro_matrix,
+					&priv->imu_calibration.gyro_offset, &raw_gyro, &gyro);
+				apply_imu_calibration(priv->imu_calibration.accel_matrix,
+					&priv->imu_calibration.accel_offset, &raw_accel, &accel);
 		}
 		else {
 				gyro = raw_gyro;
@@ -328,6 +381,16 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	      msg->touch.gyro[0] || msg->touch.gyro[1] || msg->touch.gyro[2]))
 		return;
 
+	double now = ohmd_get_tick();
+	/* IMU stream resuming after a gap = the controller slept and woke:
+	 * its radio config is fresh from boot, so re-run the wake sequence */
+	if (touch->have_calibration && touch->last_msg_time != 0 &&
+	    now - touch->last_msg_time > 5.0) {
+		LOGI("Touch controller %d resumed reporting, re-sending wake config", touch->device_num);
+		touch->wake_config_step = 0;
+	}
+	touch->last_msg_time = now;
+
 	if (!touch->have_calibration) {
 		rift_tracked_device_imu_calibration imu_calibration;
 		int i;
@@ -357,6 +420,8 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 		touch->tracked_dev = rift_tracker_add_device (hmd->tracker_ctx, touch->base.id, &imu_pose, &model_pose, &touch->calibration.leds, &imu_calibration);
 		touch->have_calibration = true;
 		dump_controller_calibration(touch);
+		/* Calibration read done - run the wake-time radio config */
+		touch->wake_config_step = 0;
 	}
 
 	// time in microseconds
@@ -390,13 +455,8 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	vec3f gyro;
 	vec3f accel;
 
-	/* For controllers, we apply the rotation matrix first,
-	 * and then add the provided factory offsets */
-	ovec3f_multiply_mat3x3(&raw_gyro, c->gyro_matrix, &gyro);
-	ovec3f_add(&gyro, &c->gyro_offset, &gyro);
-
-	ovec3f_multiply_mat3x3(&raw_accel, c->accel_matrix, &accel);
-	ovec3f_add(&accel, &c->accel_offset, &accel);
+	apply_imu_calibration(c->gyro_matrix, &c->gyro_offset, &raw_gyro, &gyro);
+	apply_imu_calibration(c->accel_matrix, &c->accel_offset, &raw_accel, &accel);
 
 	rift_tracked_device_imu_update(touch->tracked_dev, local_ts, device_ts, dt_s, &gyro, &accel, &mag);
 	touch->last_timestamp = msg->touch.timestamp;
@@ -556,6 +616,87 @@ static void check_haptics_state(rift_hmd_t *hmd, uint64_t ts, rift_touch_control
 		}
 }
 
+/* Radio maintenance, copying the Oculus runtime's wire behaviour
+ * (windows-touch-protocol.md §2). After every controller wake the runtime
+ * sends a config sequence, and then the ONLY recurring per-controller
+ * command: (0x02,0x18,dev) value 60 every ~30 s — shaped like "keep the
+ * LED blink schedule active for 60s", refreshed at half-life. We never
+ * sent any of these; prime suspect for the synchronized ~16 s optical
+ * dropouts. OHMD_RIFT_NO_RADIO_MAINT=1 disables for A/B. */
+static const struct {
+	uint8_t a, b;
+	bool to_controller; /* target this controller, else the HMD radio (0x05) */
+	uint16_t value;
+} touch_wake_config[] = {
+	{ 0x02, 0x17, true, 2 },
+	{ 0x02, 0x19, true, 10080 },
+	{ 0x02, 0x04, true, 35 },
+	{ 0x02, 0x13, true, 0 },
+	{ 0x04, 0x02, false, 19200 }, /* (re)program radio LED/exposure sync period, µs */
+};
+#define TOUCH_WAKE_CONFIG_LEN (int)(sizeof(touch_wake_config)/sizeof(touch_wake_config[0]))
+#define RIFT_RADIO_DEVICE_HMD 0x05
+#define TOUCH_WATCHDOG_INTERVAL 30.0
+#define TOUCH_WATCHDOG_VALUE 60
+
+static bool radio_maint_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_RADIO_MAINT");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+static void check_radio_maintenance(rift_hmd_t *hmd, rift_touch_controller_t *touch)
+{
+	double now = ohmd_get_tick();
+	int ret;
+
+	if (!radio_maint_enabled() || !touch->have_calibration)
+		return;
+	/* Only talk to controllers that are awake and streaming */
+	if (touch->last_msg_time == 0 || now - touch->last_msg_time > 2.0)
+		return;
+
+	if (touch->wake_config_step >= 0 && touch->wake_config_step < TOUCH_WAKE_CONFIG_LEN) {
+		int step = touch->wake_config_step;
+		uint8_t dev = touch_wake_config[step].to_controller ?
+			touch->device_num : RIFT_RADIO_DEVICE_HMD;
+
+		ret = rift_radio_send_cmd_u16(&hmd->radio, touch_wake_config[step].a,
+			touch_wake_config[step].b, dev, touch_wake_config[step].value);
+		if (ret == 0) {
+			LOGD("Touch %d wake config step %d (0x%02x,0x%02x,0x%02x)=%u sent",
+				touch->device_num, step, touch_wake_config[step].a,
+				touch_wake_config[step].b, dev, touch_wake_config[step].value);
+			touch->wake_config_step++;
+			if (touch->wake_config_step == TOUCH_WAKE_CONFIG_LEN) {
+				LOGI("Touch controller %d wake config complete", touch->device_num);
+				touch->wake_config_step = -1;
+				touch->last_radio_watchdog = now;
+			}
+		} else if (ret != -EBUSY && ret != -EINPROGRESS) {
+			LOGW("Touch %d wake config step %d failed (%d), will retry",
+				touch->device_num, step, ret);
+			rift_touch_cancel_in_progress(&hmd->radio, touch->device_num);
+		}
+		return;
+	}
+
+	if (now - touch->last_radio_watchdog >= TOUCH_WATCHDOG_INTERVAL) {
+		ret = rift_radio_send_cmd_u16(&hmd->radio, 0x02, 0x18,
+			touch->device_num, TOUCH_WATCHDOG_VALUE);
+		if (ret == 0) {
+			LOGD("Touch %d schedule watchdog refreshed", touch->device_num);
+			touch->last_radio_watchdog = now;
+		} else if (ret != -EBUSY && ret != -EINPROGRESS) {
+			rift_touch_cancel_in_progress(&hmd->radio, touch->device_num);
+		}
+	}
+}
+
 static void update_hmd(rift_hmd_t *priv)
 {
 	unsigned char buffer[FEATURE_BUFFER_SIZE];
@@ -574,6 +715,10 @@ static void update_hmd(rift_hmd_t *priv)
 	/* Update any haptics state first */
 	check_haptics_state(priv, start, &priv->touch_dev[0]);
 	check_haptics_state(priv, start, &priv->touch_dev[1]);
+
+	/* Radio wake-config / LED-schedule watchdog */
+	check_radio_maintenance(priv, &priv->touch_dev[0]);
+	check_radio_maintenance(priv, &priv->touch_dev[1]);
 
 	// Read all the messages from the device.
 	do {

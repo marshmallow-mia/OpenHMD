@@ -272,6 +272,13 @@ struct rift_touch_controller_s {
 
 	/* Haptics test tracking */
 	rift_haptic_state haptic_state;
+
+	/* Radio maintenance, mimicking the Oculus runtime (windows-touch-protocol.md):
+	 * a one-shot config sequence after each controller wake, then a ~30s
+	 * watchdog refresh that keeps the LED blink schedule alive */
+	int wake_config_step;       /* next wake-config command index, -1 = done */
+	double last_radio_watchdog; /* time of last (0x02,0x18)=60 refresh */
+	double last_msg_time;       /* time of last radio message (awake detection) */
 };
 
 #define RIFT_RADIO_REPORT_ID			0x0c
