@@ -530,6 +530,50 @@ int rift_touch_send_haptics(rift_hmd_radio_state *radio, int device_id, bool low
 	return 0;
 }
 
+/* Send a radio command (a,b,device) whose u16 parameter travels in a
+ * preceding RADIO_READ_DATA block at bytes [3:5] — the scheme the Oculus
+ * runtime uses for all controller/radio config writes (wake-time config,
+ * the ~30s LED-schedule watchdog (0x02,0x18)=60, and the HMD radio sync
+ * period (0x04,0x02,0x05)=19200). Non-blocking: -EBUSY / -EINPROGRESS
+ * mean call again next update with the same arguments. */
+int rift_radio_send_cmd_u16(rift_hmd_radio_state *radio, uint8_t a, uint8_t b,
+	uint8_t device_id, uint16_t value)
+{
+	int ret = -1;
+
+	if (radio->cur_read_cmd != RIFT_RADIO_CMD_NONE && radio->device_in_progress != device_id)
+		return -EBUSY; /* Another device is being read right now */
+
+	if (radio->cur_read_cmd != RIFT_RADIO_CMD_NONE &&
+	    radio->cur_read_cmd != RIFT_RADIO_WRITE_CMD_CONFIG)
+		return -EBUSY; /* A different command is in progress */
+
+	radio->device_in_progress = device_id;
+
+	if (radio->cur_read_cmd == RIFT_RADIO_CMD_NONE) {
+		unsigned char buf[31];
+
+		memset(buf, 0, sizeof(buf));
+		buf[0] = RIFT_CMD_RADIO_READ_DATA;
+		buf[3] = value & 0xff;
+		buf[4] = value >> 8;
+
+		radio->cur_read_cmd = RIFT_RADIO_WRITE_CMD_CONFIG;
+		ret = rift_radio_write(radio, a, b, device_id, buf, sizeof(buf));
+	}
+	else {
+		ret = rift_radio_write_complete(radio);
+	}
+
+	if (ret < 0)
+		return ret;
+
+	radio->device_in_progress = -1;
+	radio->cur_read_cmd = RIFT_RADIO_CMD_NONE;
+
+	return 0;
+}
+
 void rift_touch_cancel_in_progress(rift_hmd_radio_state *radio, int device_id)
 {
 	if (radio->cur_read_cmd != RIFT_RADIO_CMD_NONE && radio->device_in_progress != device_id)

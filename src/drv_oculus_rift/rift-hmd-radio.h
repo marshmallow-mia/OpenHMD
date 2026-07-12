@@ -18,6 +18,7 @@ enum rift_radio_cmd_state {
 	RIFT_FW_READ_CMD_CALIBRATION_HDR,
 	RIFT_FW_READ_CMD_CALIBRATION,
 	RIFT_RADIO_WRITE_CMD_HAPTICS,
+	RIFT_RADIO_WRITE_CMD_CONFIG,
 };
 
 struct rift_hmd_radio_state {
@@ -44,6 +45,7 @@ int rift_touch_get_calibration(ohmd_context* ctx,
 void rift_touch_clear_calibration(rift_touch_calibration *calibration);
 bool rift_hmd_radio_get_address(hid_device *handle, uint8_t address[5]);
 int rift_touch_send_haptics(rift_hmd_radio_state *radio, int device_id, bool low_freq, uint8_t amplitude);
+int rift_radio_send_cmd_u16(rift_hmd_radio_state *radio, uint8_t a, uint8_t b, uint8_t device_id, uint16_t value);
 void rift_touch_cancel_in_progress(rift_hmd_radio_state *radio, int device_id);
 
 #endif /* RIFT_HMD_RADIO_H */
