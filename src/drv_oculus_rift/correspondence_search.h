@@ -73,7 +73,7 @@ struct cs_model_info_s {
 
     /* Used when CS_FLAG_MATCH_GRAVITY is set */
     vec3f gravity_vector;
-    quatf gravity_swing;
+    vec3f gravity_dev_prior; /* world-up in the prior's device frame */
     float gravity_tolerance_rad;
 };
 

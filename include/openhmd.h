@@ -185,6 +185,13 @@ typedef enum {
 
 	/** float[3] (get): A 3-D vector representing the angular acceleration of the device (rad/s^2). */
 	OHMD_ANGULAR_ACCELERATION_VECTOR      =  26,
+
+	/** float[1] (get): Age of the pose currently reported by OHMD_ROTATION_QUAT /
+	    OHMD_POSITION_VECTOR, in seconds: how long ago the sensor sample it estimates
+	    was taken. Consumers that forward-predict (e.g. SteamVR's poseTimeOffset)
+	    need this to extrapolate from the right epoch instead of assuming the pose
+	    is current. 0 if the driver does not track it. */
+	OHMD_POSE_AGE_SECONDS                 =  27,
 } ohmd_float_value;
 
 /** A collection of int value information types used for getting information with ohmd_device_geti(). */

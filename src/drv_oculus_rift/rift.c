@@ -697,6 +697,16 @@ static int getf_hmd(rift_hmd_t *hmd, ohmd_float_value type, float* out)
 		*(vec3f*)out = ang_vel;
 		break;
 	}
+	case OHMD_POSE_AGE_SECONDS: {
+		uint64_t age_ns = 0;
+
+		if (hmd->tracked_dev) {
+			age_ns = rift_tracked_device_get_pose_age_ns(hmd->tracked_dev,
+			                                             ohmd_monotonic_get(hmd->ctx));
+		}
+		out[0] = (float) age_ns * 1e-9f;
+		break;
+	}
 	case OHMD_CONTROLS_STATE:
 		out[0] = (hmd->remote_buttons_state & RIFT_REMOTE_BUTTON_UP) != 0;
 		out[1] = (hmd->remote_buttons_state & RIFT_REMOTE_BUTTON_DOWN) != 0;
@@ -762,6 +772,16 @@ static int getf_touch_controller(rift_device_priv* dev_priv, ohmd_float_value ty
 			rift_tracked_device_get_view_pose(touch->tracked_dev, NULL, NULL, NULL, &ang_vel);
 		}
 		*(vec3f*)out = ang_vel;
+		break;
+	}
+	case OHMD_POSE_AGE_SECONDS: {
+		uint64_t age_ns = 0;
+
+		if (touch->tracked_dev) {
+			age_ns = rift_tracked_device_get_pose_age_ns(touch->tracked_dev,
+			                                             ohmd_monotonic_get(touch->base.base.ctx));
+		}
+		out[0] = (float) age_ns * 1e-9f;
 		break;
 	}
 	case OHMD_DISTORTION_K:
@@ -1166,6 +1186,36 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 		size = encode_enable_components(buf, true, true, true);
 		if (send_feature_report(priv, buf, size) == -1)
 			LOGE("error turning the screens on");
+
+		/* Configure the panel for low persistence. Feature report 0x0d:
+		 * u8 report_id, u16 command_id, u8 brightness, u32 flags,
+		 * u16 persistence (rows lit per frame), u16 lighting_offset,
+		 * u16 pixel_settle (ro), u16 total_rows (ro).
+		 * The panel powers up with persistence == total_rows (full
+		 * persistence), which smears badly during head motion. */
+		{
+			unsigned char dbuf[FEATURE_BUFFER_SIZE];
+			int dsize = get_feature_report(priv, (rift_sensor_feature_cmd)0x0d, dbuf);
+			if (dsize >= 16) {
+				uint16_t persistence = dbuf[8] | (dbuf[9] << 8);
+				uint16_t total_rows = dbuf[14] | (dbuf[15] << 8);
+				uint32_t dflags = dbuf[4] | (dbuf[5] << 8) | (dbuf[6] << 16) | ((uint32_t)dbuf[7] << 24);
+				LOGI("CV1 display config: brightness=%u flags=0x%x persistence=%u/%u rows",
+				     dbuf[3], dflags, persistence, total_rows);
+				if (total_rows > 0 && persistence > total_rows / 2) {
+					/* ~2ms of the 11.1ms frame, like the official runtime */
+					uint16_t low_persistence = (uint16_t)((total_rows * 18) / 100);
+					dbuf[8] = low_persistence & 0xff;
+					dbuf[9] = low_persistence >> 8;
+					if (send_feature_report(priv, dbuf, 16) == -1)
+						LOGE("failed to set CV1 low persistence");
+					else
+						LOGI("CV1 low persistence set: %u/%u rows", low_persistence, total_rows);
+				}
+			} else {
+				LOGE("could not read CV1 display config (res %d)", dsize);
+			}
+		}
 
 		rift_send_tracking_config (priv, false, RIFT_TRACKING_EXPOSURE_US_CV1,
 				RIFT_TRACKING_PERIOD_US_CV1);

@@ -264,19 +264,27 @@ correspondence_search_project_pose (correspondence_search_t *cs, led_search_mode
 
 	/* See if we need to make a gravity vector alignment check */
 	if (mi->search_flags & CS_FLAG_MATCH_GRAVITY) {
-		quatf pose_gravity_swing, pose_gravity_twist;
+		/* Tilt-vs-gravity error, yaw- and camera-roll-invariant: compare
+		 * world-up expressed in the candidate's device frame against the
+		 * same vector in the prior's device frame (see the note where
+		 * gravity_dev_prior is computed). */
+		vec3f gravity_dev;
+		quatf cand_orient_inv = pose->orient;
+		oquatf_inverse(&cand_orient_inv);
+		oquatf_get_rotated(&cand_orient_inv, &mi->gravity_vector, &gravity_dev);
 
-		oquatf_decompose_swing_twist(&pose->orient, &mi->gravity_vector, &pose_gravity_swing, &pose_gravity_twist);
-
-		float pose_angle = acosf(oquatf_get_dot(&pose_gravity_swing, &mi->gravity_swing));
-		if (pose_angle > mi->gravity_tolerance_rad) {
+		float dot = ovec3f_get_dot(&gravity_dev, &mi->gravity_dev_prior);
+		if (dot > 1.0f) dot = 1.0f;
+		if (dot < -1.0f) dot = -1.0f;
+		float pose_angle = acosf(dot);
+		if (getenv("OHMD_RIFT_NO_GRAVITY_GATE") == NULL && pose_angle > mi->gravity_tolerance_rad) {
 			DEBUG("model %d failed pose match - orientation was not within tolerance (error %f deg > %f deg)\n"
-			    "gravity vec %f %f %f pose %f %f %f %f swing %f %f %f %f prior swing %f %f %f %f\n",
+			    "gravity vec %f %f %f pose %f %f %f %f g_dev %f %f %f prior g_dev %f %f %f\n",
 			    mi->id, RAD_TO_DEG(pose_angle), RAD_TO_DEG(mi->gravity_tolerance_rad),
 			    mi->gravity_vector.x, mi->gravity_vector.y, mi->gravity_vector.z,
 			    pose->orient.x, pose->orient.y, pose->orient.z, pose->orient.w,
-			    pose_gravity_swing.x, pose_gravity_swing.y, pose_gravity_swing.z, pose_gravity_swing.w,
-			    mi->gravity_swing.x, mi->gravity_swing.y, mi->gravity_swing.z, mi->gravity_swing.w
+			    gravity_dev.x, gravity_dev.y, gravity_dev.z,
+			    mi->gravity_dev_prior.x, mi->gravity_dev_prior.y, mi->gravity_dev_prior.z
 			    );
 			return false;
 		}
@@ -482,8 +490,8 @@ check_led_against_model_subset (correspondence_search_t *cs, cs_model_info_t *mi
       ovec3f_subtract (&checkpos, &blob0, &tmp);
       l = ovec3f_get_length (&tmp);
       if (!(l <= 0.0025)) {
-	      printf ("Error pose candidate orient %f %f %f %f pos %f %f %f "
-            "Anchor LED %f %f %f projected to %f %f %f (err %f)\n",
+	      LOGD ("Error pose candidate orient %f %f %f %f pos %f %f %f "
+            "Anchor LED %f %f %f projected to %f %f %f (err %f)",
             pose.orient.x, pose.orient.y, pose.orient.z, pose.orient.w,
             pose.pos.x, pose.pos.y, pose.pos.z,
             blob0.x, blob0.y, blob0.z,
@@ -820,16 +828,26 @@ bool correspondence_search_find_one_pose (correspondence_search_t *cs, int model
     }
 
     if (search_flags & CS_FLAG_MATCH_GRAVITY) {
-	    quatf pose_gravity_twist;
-
-      /* We need a pose prior to extract the gravity swing to match */
+      /* We need a pose prior to extract the gravity direction to match */
       assert ((search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0);
       assert (gravity_vector != NULL);
 
       mi->gravity_vector = *gravity_vector;
       mi->gravity_tolerance_rad = gravity_tolerance_rad;
 
-      oquatf_decompose_swing_twist(&pose->orient, gravity_vector, &mi->gravity_swing, &pose_gravity_twist);
+      /* World-up in the prior's device frame. Comparing this direction
+       * between prior and candidate measures tilt-vs-gravity error and is
+       * exactly invariant to yaw (rotation about gravity) and to camera
+       * roll. The previous swing-twist comparison decomposed the camera
+       * frame orientation about the camera-frame gravity axis, but in the
+       * swing*twist convention the twist acts in the device frame, so the
+       * axis was in the wrong frame: approximately right for an upright
+       * camera, but a camera rolled 90-180 degrees saw up to ~90 degrees of
+       * phantom error and rejected every true pose (an upside-down mounted
+       * sensor could never acquire optical lock). */
+      quatf prior_orient_inv = pose->orient;
+      oquatf_inverse(&prior_orient_inv);
+      oquatf_get_rotated(&prior_orient_inv, gravity_vector, &mi->gravity_dev_prior);
     }
 
     if (search_pose_for_model (cs, mi) && (mi->match_flags & RIFT_POSE_MATCH_GOOD)) {

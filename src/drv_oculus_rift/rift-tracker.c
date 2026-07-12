@@ -15,10 +15,12 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <time.h>
+#include <math.h>
 
 #include "ohmd-video.h"
 
 #include "../exponential-filter.h"
+#include "rift-fusion-ovr.h"
 #include "rift-tracker.h"
 #include "rift-tracker-config.h"
 #include "rift-sensor.h"
@@ -28,6 +30,7 @@
 #include "rift-sensor-maths.h"
 #include "rift-sensor-opencv.h"
 #include "rift-sensor-pose-helper.h"
+#include "rift-sensor-pose-search.h"
 
 #include "rift-debug-draw.h"
 
@@ -57,6 +60,19 @@
  */
 #define NO_FREE_DELAY_SLOT_THRESHOLD 60
 
+/* Output correction bleeding: each discrete optical Kalman update is absorbed
+ * into an offset between the fusion state and the displayed pose, which then
+ * bleeds away smoothly (never a visible step). Bleed speeds up while the head
+ * is moving, when the eye can't detect it. Offsets larger than the clamps
+ * (bad prior / re-acquisition) step through immediately. */
+#define OUT_CORR_TAU 0.3f                    /* bleed time constant, seconds */
+#define OUT_CORR_ANG_REF 1.0f                /* rad/s of head rotation that doubles the bleed rate */
+#define OUT_CORR_LIN_REF 0.5f                /* m/s of head motion that doubles the bleed rate */
+#define OUT_CORR_MIN_ANG_RATE DEG_TO_RAD(0.5f) /* minimum bleed, rad/s */
+#define OUT_CORR_MIN_LIN_RATE 0.005f         /* minimum bleed, m/s */
+#define OUT_CORR_MAX_ANG DEG_TO_RAD(3.0f)    /* clamp: larger corrections step */
+#define OUT_CORR_MAX_LIN 0.05f               /* clamp: larger corrections step, m */
+
 #define MIN_ROT_ERROR DEG_TO_RAD(25)
 #define MIN_POS_ERROR 0.1
 
@@ -80,6 +96,7 @@ struct rift_tracker_pose_report {
 		bool report_used; /* TRUE if this report has been integrated */
 		posef pose;
 		rift_pose_metrics score;
+		float obs_scale; /* confidence tier the report was integrated with */
 };
 
 struct rift_tracker_pose_delay_slot {
@@ -106,6 +123,8 @@ struct rift_tracked_device_priv {
 
 	/* 6DOF Kalman Filter */
 	rift_kalman_6dof_filter ukf_fusion;
+	/* OVR-SDK-style complementary filter (default backend) */
+	rift_fusion_ovr ovr_fusion;
 
 	/* Account keeping for UKF fusion slots */
 	int n_delay_slots;
@@ -124,6 +143,12 @@ struct rift_tracked_device_priv {
 	uint32_t last_device_ts;
 	uint64_t device_time_ns;
 
+	/* Host-clock arrival time of the most recent IMU sample. The fused pose is
+	 * a state estimate at this instant, so (now - last_imu_local_ts) is the age
+	 * of the pose we hand out — which is what SteamVR's DriverPose_t
+	 * poseTimeOffset wants, so it can predict forward from the right epoch. */
+	uint64_t last_imu_local_ts;
+
 	uint64_t last_observed_orient_ts;
 	uint64_t last_observed_pose_ts;
 	posef last_observed_pose;
@@ -137,9 +162,20 @@ struct rift_tracked_device_priv {
 	vec3f reported_lin_vel;
 	vec3f reported_lin_accel;
 
+	/* EMA state for the exported-velocity low-pass (see get_view_pose) */
+	vec3f vel_filt;
+	vec3f ang_vel_filt;
+	uint64_t vel_filt_ts;
+
 	posef model_pose;
 
 	exp_filter_pose pose_output_filter;
+
+	/* Output correction offset (global frame): absorbs discrete optical-update
+	 * jumps so the displayed pose stays continuous; bled off in
+	 * rift_tracked_device_get_view_pose */
+	quatf out_corr_orient;
+	vec3f out_corr_pos;
 
 	int num_pending_imu_observations;
 	rift_tracked_device_imu_observation pending_imu_observations[RIFT_MAX_PENDING_IMU_OBSERVATIONS];
@@ -170,6 +206,101 @@ struct rift_tracker_ctx_s
 	uint8_t n_devices;
 };
 
+/* Fusion backend selection: default is the OVR-SDK-style complementary
+ * filter ported from Oculus SDK 0.3.2 (rift-fusion-ovr.c). Set
+ * OHMD_RIFT_FUSION=ukf to use the original UKF instead. */
+static bool use_ovr_fusion(void)
+{
+	static int use = -1;
+	if (use == -1) {
+		const char *e = getenv("OHMD_RIFT_FUSION");
+		use = !(e && strcmp(e, "ukf") == 0);
+	}
+	return use;
+}
+
+static void fusion_imu_update(rift_tracked_device_priv *dev, uint64_t time,
+	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag)
+{
+	if (use_ovr_fusion())
+		rift_fusion_ovr_imu_update(&dev->ovr_fusion, time, ang_vel, accel, mag);
+	else
+		rift_kalman_6dof_imu_update(&dev->ukf_fusion, time, ang_vel, accel, mag);
+}
+
+static void fusion_pose_update(rift_tracked_device_priv *dev, uint64_t time,
+	posef *pose, int delay_slot, float obs_scale, bool replace_pending)
+{
+	if (use_ovr_fusion())
+		rift_fusion_ovr_pose_update(&dev->ovr_fusion, time, pose, delay_slot, obs_scale, replace_pending);
+	else
+		rift_kalman_6dof_pose_update(&dev->ukf_fusion, time, pose, delay_slot, obs_scale);
+}
+
+static void fusion_position_update(rift_tracked_device_priv *dev, uint64_t time,
+	vec3f *position, int delay_slot, float obs_scale, bool replace_pending)
+{
+	if (use_ovr_fusion())
+		rift_fusion_ovr_position_update(&dev->ovr_fusion, time, position, delay_slot, obs_scale, replace_pending);
+	else
+		rift_kalman_6dof_position_update(&dev->ukf_fusion, time, position, delay_slot, obs_scale);
+}
+
+static void fusion_prepare_delay_slot(rift_tracked_device_priv *dev, uint64_t time, int delay_slot)
+{
+	if (use_ovr_fusion())
+		rift_fusion_ovr_prepare_delay_slot(&dev->ovr_fusion, time, delay_slot);
+	else
+		rift_kalman_6dof_prepare_delay_slot(&dev->ukf_fusion, time, delay_slot);
+}
+
+static void fusion_get_pose_at(rift_tracked_device_priv *dev, uint64_t time, posef *pose,
+	vec3f *vel, vec3f *accel, vec3f *ang_vel, vec3f *pos_error, vec3f *rot_error)
+{
+	if (use_ovr_fusion())
+		rift_fusion_ovr_get_pose_at(&dev->ovr_fusion, time, pose, vel, accel, ang_vel, pos_error, rot_error);
+	else
+		rift_kalman_6dof_get_pose_at(&dev->ukf_fusion, time, pose, vel, accel, ang_vel, pos_error, rot_error);
+}
+
+static void fusion_get_delay_slot_pose_at(rift_tracked_device_priv *dev, uint64_t time, int delay_slot,
+	posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel, vec3f *pos_error, vec3f *rot_error)
+{
+	if (use_ovr_fusion())
+		rift_fusion_ovr_get_delay_slot_pose_at(&dev->ovr_fusion, time, delay_slot, pose, vel, accel, ang_vel, pos_error, rot_error);
+	else
+		rift_kalman_6dof_get_delay_slot_pose_at(&dev->ukf_fusion, time, delay_slot, pose, vel, accel, ang_vel, pos_error, rot_error);
+}
+
+/* Set OHMD_RIFT_NO_OBS_MERGE=1 to disable merging of same-exposure
+ * observations from multiple sensors (for A/B testing). Without merging,
+ * each sensor's fix is applied sequentially and the fused pose lands near
+ * whichever sensor's correction arrived last; the arrival order races and
+ * flips quasi-periodically, oscillating the output between the two cameras'
+ * solutions (measured: 7.5 Hz line, amplitude = cross-camera disagreement —
+ * see rift-cv1-center/rest-wander-analysis.md). */
+static bool obs_merge_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_OBS_MERGE");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+/* Set OHMD_RIFT_NO_BLEED=1 to disable output correction bleeding (for A/B
+ * testing): optical corrections then step the displayed pose directly. */
+static bool out_corr_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_BLEED");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
 static void rift_tracked_device_send_imu_debug(rift_tracked_device_priv *dev);
 static void rift_tracked_device_send_debug_printf(rift_tracked_device_priv *dev, uint64_t local_ts, const char *fmt, ...);
 
@@ -198,9 +329,15 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 	next_dev->base.id = device_id;
 	next_dev->n_delay_slots = ctx->n_sensors != 0 ? NUM_POSE_DELAY_SLOTS : 0;
 	rift_kalman_6dof_init(&next_dev->ukf_fusion, &init_pose, next_dev->n_delay_slots);
+	rift_fusion_ovr_init(&next_dev->ovr_fusion, &init_pose, next_dev->n_delay_slots);
+	LOGI("Device %d using %s fusion backend", device_id,
+		use_ovr_fusion() ? "OVR-SDK complementary" : "UKF");
 	next_dev->last_acquired_pose_lock_ts = next_dev->last_reported_pose = next_dev->last_observed_orient_ts = next_dev->last_observed_pose_ts = next_dev->device_time_ns = 0;
 
 	exp_filter_pose_init(&next_dev->pose_output_filter);
+
+	oquatf_set(&next_dev->out_corr_orient, 0, 0, 0, 1);
+	ovec3f_set(&next_dev->out_corr_pos, 0, 0, 0);
 
 	/* Init delay slot bookkeeping */
 	for (s = 0; s < next_dev->n_delay_slots; s++) {
@@ -240,6 +377,7 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 
 	next_dev->base.leds = leds;
 	next_dev->base.led_search = led_search_model_new (leds);
+	rift_cal_capture_register_leds (device_id, leds);
 	ctx->n_devices++;
 	ohmd_unlock_mutex (ctx->tracker_lock);
 
@@ -483,15 +621,64 @@ rift_tracker_frame_captured (rift_tracker_ctx *ctx, uint64_t local_ts, uint64_t 
 	int i;
 	ohmd_lock_mutex (ctx->tracker_lock);
 
-	/* Find and populate the exposure info and return true if found */
+	/* Find and populate the exposure info and return true if found.
+	 * Exposures are only ~19.2ms apart, so with a +/-10ms acceptance
+	 * window adjacent exposures overlap - always pick the CLOSEST one,
+	 * not the last one that falls inside the window. */
 	bool have_exposure_info = false;
+	int64_t best_abs_ns = INT64_MAX;
+	int64_t best_diff_ns = 0;
 
 	for (i = 0; i < ctx->exposure_history_size; i++) {
 		rift_tracker_exposure_info *info = ctx->exposure_history + i;
 		int64_t time_diff_ns = frame_start_local_ts - info->local_ts;
-		if (time_diff_ns > -10000000 && time_diff_ns < 10000000) {
-			have_exposure_info = true;
-			*out_info = *info;
+		int64_t abs_ns = time_diff_ns < 0 ? -time_diff_ns : time_diff_ns;
+		if (abs_ns < best_abs_ns) {
+			best_abs_ns = abs_ns;
+			best_diff_ns = time_diff_ns;
+			if (abs_ns < 10000000) {
+				have_exposure_info = true;
+				*out_info = *info;
+			}
+		}
+	}
+
+	/* Temporary telemetry: per-sensor frame-vs-exposure timing statistics */
+	{
+		#define FC_MAX_SOURCES 4
+		static struct {
+			const char *src;
+			int n, missed;
+			double sum_ms, min_ms, max_ms;
+		} fc_stats[FC_MAX_SOURCES];
+		int s;
+		double diff_ms = (double)best_diff_ns / 1e6;
+		for (s = 0; s < FC_MAX_SOURCES; s++) {
+			if (fc_stats[s].src == source)
+				break;
+			if (fc_stats[s].src == NULL) {
+				fc_stats[s].src = source;
+				fc_stats[s].min_ms = 1e9;
+				fc_stats[s].max_ms = -1e9;
+				break;
+			}
+		}
+		if (s < FC_MAX_SOURCES) {
+			fc_stats[s].n++;
+			if (!have_exposure_info)
+				fc_stats[s].missed++;
+			fc_stats[s].sum_ms += diff_ms;
+			if (diff_ms < fc_stats[s].min_ms) fc_stats[s].min_ms = diff_ms;
+			if (diff_ms > fc_stats[s].max_ms) fc_stats[s].max_ms = diff_ms;
+			if (fc_stats[s].n >= 300) {
+				LOGI("frame-timing %s: %d frames, %d missed exposure, diff avg %.2f min %.2f max %.2f ms",
+				    source, fc_stats[s].n, fc_stats[s].missed,
+				    fc_stats[s].sum_ms / fc_stats[s].n, fc_stats[s].min_ms, fc_stats[s].max_ms);
+				fc_stats[s].n = fc_stats[s].missed = 0;
+				fc_stats[s].sum_ms = 0;
+				fc_stats[s].min_ms = 1e9;
+				fc_stats[s].max_ms = -1e9;
+			}
 		}
 	}
 
@@ -608,8 +795,9 @@ void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t loca
 		dev->device_time_ns += dt_ns;
 	}
 	dev->last_device_ts = device_ts;
+	dev->last_imu_local_ts = local_ts;
 
-	rift_kalman_6dof_imu_update (&dev->ukf_fusion, dev->device_time_ns, ang_vel, accel, mag_field);
+	fusion_imu_update(dev, dev->device_time_ns, ang_vel, accel, mag_field);
 
 	obs = dev->pending_imu_observations + dev->num_pending_imu_observations;
 	obs->local_ts = local_ts;
@@ -629,6 +817,66 @@ void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t loca
 	ohmd_unlock_mutex (dev->device_lock);
 }
 
+/* Forward-prediction horizon for the pose handed to API consumers, in seconds.
+ * OHMD_RIFT_PREDICT_MS=<ms>, default 0 (off). See the note in
+ * rift_tracked_device_get_view_pose about double-prediction under SteamVR. */
+static float out_predict_secs(void)
+{
+	static float predict_s = -1.0f;
+
+	if (predict_s < 0.0f) {
+		const char *e = getenv("OHMD_RIFT_PREDICT_MS");
+		float ms = e ? (float) atof(e) : 0.0f;
+
+		if (ms < 0.0f)
+			ms = 0.0f;
+		if (ms > 100.0f)  /* sanity clamp; beyond this the linear model is junk */
+			ms = 100.0f;
+		predict_s = ms / 1000.0f;
+	}
+
+	return predict_s;
+}
+
+/* Dead-reckon a pose forward by dt.
+ *
+ * Orientation integrates the DEVICE-LOCAL angular velocity, so the delta
+ * quaternion right-multiplies (body-frame rotation) — the same form Oculus
+ * used in SDK 0.3.2's SensorFusion::GetPredictedOrientation. Position uses the
+ * world-frame velocity and acceleration, which is the frame the fusion already
+ * reports them in:  p += v*dt + a*dt^2/2,  v += a*dt. */
+static void rift_predict_pose(posef *pose, vec3f *vel, const vec3f *accel,
+	const vec3f *ang_vel, float dt)
+{
+	float w = ovec3f_get_length((vec3f *) ang_vel);
+
+	if (w > 1e-6f) {
+		vec3f axis;
+		quatf dq, out;
+		float half = 0.5f * w * dt;
+		float s = sinf(half);
+
+		ovec3f_multiply_scalar((vec3f *) ang_vel, 1.0f / w, &axis);
+		dq.x = axis.x * s;
+		dq.y = axis.y * s;
+		dq.z = axis.z * s;
+		dq.w = cosf(half);
+
+		oquatf_mult(&pose->orient, &dq, &out);
+		oquatf_normalize_me(&out);
+		pose->orient = out;
+	}
+
+	vec3f tmp;
+	ovec3f_multiply_scalar(vel, dt, &tmp);
+	ovec3f_add(&pose->pos, &tmp, &pose->pos);
+	ovec3f_multiply_scalar((vec3f *) accel, 0.5f * dt * dt, &tmp);
+	ovec3f_add(&pose->pos, &tmp, &pose->pos);
+
+	ovec3f_multiply_scalar((vec3f *) accel, dt, &tmp);
+	ovec3f_add(vel, &tmp, vel);
+}
+
 void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel)
 {
 	rift_tracked_device_priv *dev = (rift_tracked_device_priv *) (dev_base);
@@ -641,7 +889,53 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		vec3f imu_ang_vel = { 0, };
 		vec3f imu_vel = { 0, }, imu_accel = { 0, };
 
-		rift_kalman_6dof_get_pose_at(&dev->ukf_fusion, dev->device_time_ns, &imu_global_pose, &imu_vel, &imu_accel, &imu_ang_vel, NULL, NULL);
+		fusion_get_pose_at(dev, dev->device_time_ns, &imu_global_pose, &imu_vel, &imu_accel, &imu_ang_vel, NULL, NULL);
+
+		/* Bleed off the output correction offset, faster while the head is
+		 * moving, then apply what remains so optical corrections leak into
+		 * the displayed pose instead of stepping it at camera rate */
+		if (out_corr_enabled()) {
+			float dt = 0.1f;
+			if (dev->last_reported_pose != 0 && dev->device_time_ns > dev->last_reported_pose)
+				dt = (float)(dev->device_time_ns - dev->last_reported_pose) * 1e-9f;
+			if (dt > 0.1f)
+				dt = 0.1f;
+
+			vec3f corr_rot;
+			oquatf_to_rotation(&dev->out_corr_orient, &corr_rot);
+			float angle = ovec3f_get_length(&corr_rot);
+			if (angle > 1e-6f) {
+				float rate = (1.0f / OUT_CORR_TAU) * (1.0f + ovec3f_get_length(&imu_ang_vel) / OUT_CORR_ANG_REF);
+				float new_angle = angle * expf(-rate * dt) - OUT_CORR_MIN_ANG_RATE * dt;
+				if (new_angle < 0.0f)
+					new_angle = 0.0f;
+				if (new_angle > OUT_CORR_MAX_ANG)
+					new_angle = OUT_CORR_MAX_ANG;
+				ovec3f_multiply_scalar(&corr_rot, new_angle / angle, &corr_rot);
+				oquatf_from_rotation(&dev->out_corr_orient, &corr_rot);
+			} else {
+				oquatf_set(&dev->out_corr_orient, 0, 0, 0, 1);
+			}
+
+			float dist = ovec3f_get_length(&dev->out_corr_pos);
+			if (dist > 1e-6f) {
+				float rate = (1.0f / OUT_CORR_TAU) * (1.0f + ovec3f_get_length(&imu_vel) / OUT_CORR_LIN_REF);
+				float new_dist = dist * expf(-rate * dt) - OUT_CORR_MIN_LIN_RATE * dt;
+				if (new_dist < 0.0f)
+					new_dist = 0.0f;
+				if (new_dist > OUT_CORR_MAX_LIN)
+					new_dist = OUT_CORR_MAX_LIN;
+				ovec3f_multiply_scalar(&dev->out_corr_pos, new_dist / dist, &dev->out_corr_pos);
+			} else {
+				ovec3f_set(&dev->out_corr_pos, 0, 0, 0);
+			}
+
+			quatf corrected_orient;
+			oquatf_mult(&dev->out_corr_orient, &imu_global_pose.orient, &corrected_orient);
+			oquatf_normalize_me(&corrected_orient);
+			imu_global_pose.orient = corrected_orient;
+			ovec3f_add(&imu_global_pose.pos, &dev->out_corr_pos, &imu_global_pose.pos);
+		}
 
 		/* Take our fusion / IMU global pose back to device pose by
 		 * computing the IMU->device pose and applying the
@@ -659,32 +953,125 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		exp_filter_pose_run(&dev->pose_output_filter, dev->device_time_ns, &device_pose, &dev->reported_pose);
 		dev->last_reported_pose = dev->device_time_ns;
 
-		/* Angular Velocity and acceleration need rotating into the device space.
-		 * Linear velocity should also acquire a component from angular velocity */
-		oquatf_get_rotated(&dev->device_from_fusion.orient, &imu_ang_vel, &dev->reported_ang_vel);
-		oquatf_get_rotated(&dev->device_from_fusion.orient, &imu_accel, &dev->reported_lin_accel);
+		/* SteamVR's pose prediction expects LINEAR velocity in world space
+		 * but ANGULAR velocity in the device-local frame ("controller
+		 * space") — see Monado's ovrd_driver.cpp (world->local inversion
+		 * with that comment) and steamvr_lh/device.cpp (rotating Valve's
+		 * own lighthouse driver output local->world when consuming it).
+		 *
+		 * The gyro rate is in the IMU body frame; device-local is one
+		 * static mount rotation away: w_dev = R_dff^-1 * w_imu (identity
+		 * for the CV1 HMD, non-trivial for Touch controllers).
+		 *
+		 * The fusion velocity and acceleration are already world-frame.
+		 * Linear velocity also acquires a component from rotation at the
+		 * IMU->device lever arm (body frame), rotated into the world.
+		 *
+		 * NOTE: Valve's driver docs claim world space for vecAngularVelocity,
+		 * contradicting the lighthouse driver's observed behavior. Default
+		 * device-local; set OHMD_RIFT_ANGVEL_FRAME=world to A/B. */
+		static int angvel_world = -1;
+		if (angvel_world == -1) {
+			const char *e = getenv("OHMD_RIFT_ANGVEL_FRAME");
+			angvel_world = (e && strcmp(e, "world") == 0);
+		}
+		if (angvel_world) {
+			oquatf_get_rotated(&imu_global_pose.orient, &imu_ang_vel, &dev->reported_ang_vel);
+		} else {
+			quatf fusion_from_device_orient = dev->device_from_fusion.orient;
+			oquatf_inverse(&fusion_from_device_orient);
+			oquatf_get_rotated(&fusion_from_device_orient, &imu_ang_vel, &dev->reported_ang_vel);
+		}
+		dev->reported_lin_accel = imu_accel;
 
-		/* Linear velocity generated by the angular velocity at the IMU offset
-		 * is the cross product of the (rotated) position and the angular
-		 * velocity */
-		vec3f rotated_imu_pos, extra_lin_vel;
-		oquatf_get_rotated(&dev->device_from_fusion.orient, &dev->device_from_fusion.pos, &rotated_imu_pos);
-		ovec3f_cross(&dev->reported_ang_vel, &rotated_imu_pos, &extra_lin_vel);
+		vec3f lever_vel_body, lever_vel_world;
+		ovec3f_cross(&imu_ang_vel, &dev->device_from_fusion.pos, &lever_vel_body);
+		oquatf_get_rotated(&imu_global_pose.orient, &lever_vel_body, &lever_vel_world);
+		ovec3f_add(&imu_vel, &lever_vel_world, &dev->reported_lin_vel);
 
-		oquatf_get_rotated(&dev->device_from_fusion.orient, &imu_vel, &dev->reported_lin_vel);
-		ovec3f_add(&dev->reported_lin_vel, &dev->reported_lin_vel, &extra_lin_vel);
+		/* Low-pass the exported velocities. Consumers (SteamVR's compositor)
+		 * multiply them by a ~40 ms photon-prediction horizon EVERY rendered
+		 * frame, so raw instantaneous velocity noise becomes visible shimmer:
+		 * 0.1 m/s of rest noise = +-4 mm of wobble in the rendered pose. An
+		 * EMA with a ~25 ms time constant kills the shimmer for the cost of
+		 * ~25 ms of velocity lag under hard acceleration (partially covered
+		 * by the separately-exported acceleration term).
+		 * OHMD_RIFT_VEL_SMOOTH_MS overrides, 0 disables. */
+		{
+			static float tau_s = -1.0f;
+			if (tau_s < 0.0f) {
+				const char *e = getenv("OHMD_RIFT_VEL_SMOOTH_MS");
+				float ms = e ? (float) atof(e) : 25.0f;
+				if (ms < 0.0f)
+					ms = 0.0f;
+				tau_s = ms / 1000.0f;
+			}
+			if (tau_s > 0.0f) {
+				float sdt = 0.001f;
+				if (dev->vel_filt_ts != 0 && dev->device_time_ns > dev->vel_filt_ts) {
+					sdt = (float)(dev->device_time_ns - dev->vel_filt_ts) * 1e-9f;
+					if (sdt > 0.1f)
+						sdt = 0.1f;
+				}
+				dev->vel_filt_ts = dev->device_time_ns;
+				float alpha = sdt / (tau_s + sdt);
+				vec3f tmp;
+
+				ovec3f_subtract(&dev->reported_lin_vel, &dev->vel_filt, &tmp);
+				ovec3f_multiply_scalar(&tmp, alpha, &tmp);
+				ovec3f_add(&dev->vel_filt, &tmp, &dev->vel_filt);
+				dev->reported_lin_vel = dev->vel_filt;
+
+				ovec3f_subtract(&dev->reported_ang_vel, &dev->ang_vel_filt, &tmp);
+				ovec3f_multiply_scalar(&tmp, alpha, &tmp);
+				ovec3f_add(&dev->ang_vel_filt, &tmp, &dev->ang_vel_filt);
+				dev->reported_ang_vel = dev->ang_vel_filt;
+			}
+		}
 	}
 
+	/* Optional in-driver forward prediction, off by default.
+	 *
+	 * SteamVR already extrapolates the pose to photon time itself, using the
+	 * velocities and poseTimeOffset we hand it (see driver_openhmd.cpp), so
+	 * predicting here as well would DOUBLE-predict and overshoot. This exists
+	 * for A/B measurement, and for API consumers that do no prediction of
+	 * their own (openhmd_simple_example, the pose-log harness). Leave it at 0
+	 * for SteamVR. */
+	posef out_pose = dev->reported_pose;
+	vec3f out_vel = dev->reported_lin_vel;
+	float predict_s = out_predict_secs();
+	if (predict_s > 0.0f)
+		rift_predict_pose(&out_pose, &out_vel, &dev->reported_lin_accel,
+		                  &dev->reported_ang_vel, predict_s);
+
 	if (pose)
-		*pose = dev->reported_pose;
+		*pose = out_pose;
 	if (ang_vel)
 		*ang_vel = dev->reported_ang_vel;
 	if (accel)
 		*accel = dev->reported_lin_accel;
 	if (vel)
-		*vel = dev->reported_lin_vel;
+		*vel = out_vel;
 
 	ohmd_unlock_mutex (dev->device_lock);
+}
+
+/* Age of the fused pose: how long ago the IMU sample it is an estimate at
+ * arrived, on the host clock. SteamVR's DriverPose_t.poseTimeOffset wants the
+ * negative of this, so it predicts forward from the correct epoch instead of
+ * assuming the pose is fresh. */
+uint64_t rift_tracked_device_get_pose_age_ns(rift_tracked_device *dev_base, uint64_t now_local_ts)
+{
+	rift_tracked_device_priv *dev = (rift_tracked_device_priv *) (dev_base);
+	uint64_t age = 0;
+
+	ohmd_lock_mutex (dev->device_lock);
+	if (dev->last_imu_local_ts != 0 && now_local_ts > dev->last_imu_local_ts)
+		age = now_local_ts - dev->last_imu_local_ts;
+	ohmd_unlock_mutex (dev->device_lock);
+
+	return age;
 }
 
 static rift_tracker_pose_delay_slot *get_matching_delay_slot(rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info);
@@ -709,7 +1096,7 @@ bool rift_tracked_device_get_latest_exposure_info_pose (rift_tracked_device *dev
 		posef imu_global_pose;
 		vec3f global_pos_error, global_rot_error;
 
-		rift_kalman_6dof_get_delay_slot_pose_at(&dev->ukf_fusion, dev_info->device_time_ns, slot->slot_id, &imu_global_pose,
+		fusion_get_delay_slot_pose_at(dev, dev_info->device_time_ns, slot->slot_id, &imu_global_pose,
 						NULL, NULL, NULL, &global_pos_error, &global_rot_error);
 
 		oposef_apply(&dev->model_from_fusion, &imu_global_pose, &dev_info->capture_pose);
@@ -785,9 +1172,53 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			pos_error.x, pos_error.y, pos_error.z,
 			source);
 
+		/* Confidence tiering: only strong, LED-ID-verified observations
+		 * correct the pose at full weight. Weak matches that disagree with
+		 * the prior are rejected outright while tracking is healthy - the
+		 * IMU rides through until a trustworthy match arrives. */
+		bool recently_tracked = dev->last_observed_pose_ts != 0 &&
+			(dev->device_time_ns - dev->last_observed_pose_ts) < (POSE_LOST_THRESHOLD * 1000000UL);
+		float obs_scale;
+		if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG | RIFT_POSE_MATCH_LED_IDS))
+			obs_scale = 1.0f;
+		else if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS))
+			obs_scale = 1.5f; /* LED IDs verified: correspondence is right, geometry merely imprecise */
+		else if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG))
+			obs_scale = 2.0f;
+		else if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_POSITION | RIFT_POSE_MATCH_ORIENT))
+			obs_scale = 4.0f; /* agrees with the prior, reinforce weakly */
+		else if (!recently_tracked)
+			obs_scale = 6.0f; /* re-acquiring after loss: accept what we can get */
+		else
+			obs_scale = 0.0f; /* weak and disagreeing while tracked: reject */
+
+		/* Temporary telemetry: log the observation quality mix for the HMD */
+		if (dev->base.id == 0) {
+			static int q_total = 0, q_full = 0, q_ids = 0, q_strong = 0, q_prior = 0, q_reacq = 0, q_rej = 0;
+			static int f_ids = 0, f_strong = 0;
+			q_total++;
+			if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS)) f_ids++;
+			if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG)) f_strong++;
+			if (obs_scale == 1.0f) q_full++;
+			else if (obs_scale == 1.5f) q_ids++;
+			else if (obs_scale == 2.0f) q_strong++;
+			else if (obs_scale == 4.0f) q_prior++;
+			else if (obs_scale == 6.0f) q_reacq++;
+			else q_rej++;
+			if (q_total >= 300) {
+				LOGI("HMD obs quality: full(strong+ids) %d ids-verified %d strong %d prior-agree %d reacquire %d rejected %d | flags: led-ids %d strong %d",
+					q_full, q_ids, q_strong, q_prior, q_reacq, q_rej, f_ids, f_strong);
+				q_total = q_full = q_ids = q_strong = q_prior = q_reacq = q_rej = 0;
+				f_ids = f_strong = 0;
+			}
+		}
+
 		/* If this observation was based on a prior, but position didn't match and we already received a newer observation,
 		 * ignore it. */
-		if (dev_info->had_pose_lock && !POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_POSITION) && dev->last_observed_pose_ts > frame_device_time_ns) {
+		if (obs_scale == 0.0f) {
+			update_position = false;
+		}
+		else if (dev_info->had_pose_lock && !POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_POSITION) && dev->last_observed_pose_ts > frame_device_time_ns) {
 			update_position = false;
 			LOGI("Ignoring position observation with error %f %f %f (prior stddev was %f %f %f)\n",
 				pos_error.x, pos_error.y, pos_error.z,
@@ -798,7 +1229,7 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 		}
 
 		/* If we have a strong match, update both position and orientation */
-		if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_ORIENT)) {
+		if (obs_scale != 0.0f && POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_ORIENT)) {
 			update_orientation = true;
 			if ((dev->device_time_ns - dev->last_observed_orient_ts) > (POSE_LOST_ORIENT_THRESHOLD * 1000000UL)) {
 				LOGI("Matched orientation after %f sec", (dev->device_time_ns - dev->last_observed_pose_ts) / 1000000000.0);
@@ -807,7 +1238,8 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			if (update_position)
 				dev->last_observed_orient_ts = dev->device_time_ns;
 		}
-		else if ((dev->device_time_ns - dev->last_observed_orient_ts) > (POSE_LOST_ORIENT_THRESHOLD * 1000000UL)) {
+		else if (obs_scale != 0.0f &&
+		    (dev->device_time_ns - dev->last_observed_orient_ts) > (POSE_LOST_ORIENT_THRESHOLD * 1000000UL)) {
 			LOGI("Forcing orientation observation");
 			update_orientation = true;
 			/* Don't update the orientation match time here - only do that on an actual match */
@@ -821,15 +1253,88 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			if (dev->last_acquired_pose_lock_ts == 0)
 				dev->last_acquired_pose_lock_ts = dev->last_acquired_pose_lock_ts;
 
-			if (update_position) {
-				if (update_orientation) {
-					rift_kalman_6dof_pose_update(&dev->ukf_fusion, dev->device_time_ns, &imu_pose, slot->slot_id);
-				} else {
-					rift_kalman_6dof_position_update(&dev->ukf_fusion, dev->device_time_ns, &imu_pose.pos, slot->slot_id);
+			/* Same-exposure observation merge: both sensors expose on the
+			 * same sync pulse, so their fixes reference the same delay slot
+			 * and arrive ms apart in racing order. Applied sequentially at
+			 * near-full authority, the fused pose lands at whichever
+			 * sensor's solution corrected last and oscillates between them
+			 * as the race winner flips (~7.5 Hz, amplitude = cross-camera
+			 * disagreement). Instead, correct toward the confidence-weighted
+			 * mean position of ALL of this exposure's used observations: the
+			 * cycle then ends at the same midpoint regardless of order.
+			 * Position only — the wander is positional, and orientation
+			 * keeps its established overwrite semantics. */
+			posef fusion_target = imu_pose;
+			float fusion_scale = obs_scale;
+			bool merged = false;
+
+			if (obs_merge_enabled() && slot->n_used_reports > 0) {
+				float w_sum = 1.0f / (obs_scale * obs_scale);
+				vec3f p_acc = imu_pose.pos;
+				ovec3f_multiply_scalar(&p_acc, w_sum, &p_acc);
+				int i;
+
+				for (i = 0; i < slot->n_pose_reports; i++) {
+					rift_tracker_pose_report *prev = slot->pose_reports + i;
+					if (!prev->report_used || prev->obs_scale <= 0.0f)
+						continue;
+					float w = 1.0f / (prev->obs_scale * prev->obs_scale);
+					vec3f p = prev->pose.pos;
+					ovec3f_multiply_scalar(&p, w, &p);
+					ovec3f_add(&p_acc, &p, &p_acc);
+					w_sum += w;
+					merged = true;
 				}
-      }
+
+				if (merged) {
+					ovec3f_multiply_scalar(&p_acc, 1.0f / w_sum, &fusion_target.pos);
+					fusion_scale = 1.0f / sqrtf(w_sum);
+
+					vec3f merge_shift;
+					ovec3f_subtract(&fusion_target.pos, &imu_pose.pos, &merge_shift);
+					LOGD("dev %d slot %d: merged %d same-exposure obs, shift %f %f %f",
+						dev->base.id, slot->slot_id, slot->n_used_reports + 1,
+						merge_shift.x, merge_shift.y, merge_shift.z);
+				}
+			}
+
+			/* While tracking is healthy, fold the discrete correction this
+			 * update makes to the present state into the output offset, so
+			 * the displayed pose stays continuous and the correction bleeds
+			 * in smoothly (get_view_pose). On re-acquisition, snap. */
+			bool absorb_jump = out_corr_enabled() &&
+				recently_tracked && obs_scale > 0.0f && obs_scale < 6.0f;
+			posef state_before, state_after;
+
+			if (absorb_jump)
+				fusion_get_pose_at(dev, dev->device_time_ns, &state_before, NULL, NULL, NULL, NULL, NULL);
+
+			/* A merged fix supersedes the pending error from this exposure's
+			 * earlier fix(es) — replace, don't blend. */
+			if (update_orientation) {
+				fusion_pose_update(dev, dev->device_time_ns, &fusion_target, slot->slot_id, fusion_scale, merged);
+			} else {
+				fusion_position_update(dev, dev->device_time_ns, &fusion_target.pos, slot->slot_id, fusion_scale, merged);
+			}
+
+			if (absorb_jump) {
+				fusion_get_pose_at(dev, dev->device_time_ns, &state_after, NULL, NULL, NULL, NULL, NULL);
+
+				quatf after_inv = state_after.orient, orient_jump, new_corr;
+				oquatf_inverse(&after_inv);
+				oquatf_mult(&state_before.orient, &after_inv, &orient_jump);
+				oquatf_mult(&dev->out_corr_orient, &orient_jump, &new_corr);
+				oquatf_normalize_me(&new_corr);
+				dev->out_corr_orient = new_corr;
+
+				vec3f pos_jump;
+				ovec3f_subtract(&state_before.pos, &state_after.pos, &pos_jump);
+				ovec3f_add(&dev->out_corr_pos, &pos_jump, &dev->out_corr_pos);
+			}
+
 			dev->last_observed_pose_ts = dev->device_time_ns;
-			dev->last_observed_pose = imu_pose;
+			/* the merged position is the better estimate for search priors */
+			dev->last_observed_pose = fusion_target;
 		}
 
 		frame_fusion_slot = slot->slot_id;
@@ -838,8 +1343,12 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			rift_tracker_pose_report *report = slot->pose_reports + slot->n_pose_reports;
 
 			report->report_used = update_position;
+			/* store the RAW observation (not the merged target) so later
+			 * same-exposure merges weight original measurements, and the
+			 * per-sensor confidence it was integrated with */
 			report->pose = imu_pose;
 			report->score = *score;
+			report->obs_scale = obs_scale;
 
 			if (update_position)
 				slot->n_used_reports++;
@@ -886,7 +1395,7 @@ void rift_tracked_device_get_model_pose_locked(rift_tracked_device_priv *dev, ui
 	posef imu_global_pose, model_pose;
 	vec3f global_pos_error, global_rot_error;
 
-	rift_kalman_6dof_get_pose_at(&dev->ukf_fusion, dev->device_time_ns, &imu_global_pose, NULL, NULL, NULL, &global_pos_error, &global_rot_error);
+	fusion_get_pose_at(dev, dev->device_time_ns, &imu_global_pose, NULL, NULL, NULL, &global_pos_error, &global_rot_error);
 
 	/* Apply the pose conversion from IMU->model */
 	oposef_apply(&dev->model_from_fusion, &imu_global_pose, &model_pose);
@@ -1075,7 +1584,7 @@ rift_tracked_device_on_new_exposure(rift_tracked_device_priv *dev, rift_tracked_
 		dev_info->fusion_slot = slot->slot_id;
 
 		/* Tell the kalman filter to prepare the delay slot */
-		rift_kalman_6dof_prepare_delay_slot(&dev->ukf_fusion, dev_info->device_time_ns, slot->slot_id);
+		fusion_prepare_delay_slot(dev, dev_info->device_time_ns, slot->slot_id);
 
 		/* Clear the last no-free-delay-slot tracking to avoid logging noise */
 		dev->last_no_free_delay_slot = 0;

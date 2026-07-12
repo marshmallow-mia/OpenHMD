@@ -28,6 +28,7 @@ void rift_tracker_free (rift_tracker_ctx *ctx);
 
 void rift_tracked_device_imu_update(rift_tracked_device *dev, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field);
 void rift_tracked_device_get_view_pose(rift_tracked_device *dev, posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel);
+uint64_t rift_tracked_device_get_pose_age_ns(rift_tracked_device *dev, uint64_t now_local_ts);
 
 bool rift_tracked_device_get_latest_exposure_info_pose (rift_tracked_device *dev, rift_tracked_device_exposure_info *dev_info);
 

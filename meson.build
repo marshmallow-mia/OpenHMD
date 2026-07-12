@@ -139,6 +139,7 @@ if _drivers.contains('rift')
 		'src/drv_oculus_rift/rift-tracker.c',
 		'src/drv_oculus_rift/rift-tracker-config.c',
 		'src/drv_oculus_rift/rift-kalman-6dof.c',
+		'src/drv_oculus_rift/rift-fusion-ovr.c',
     'src/drv_oculus_rift/correspondence_search.c',
     'src/drv_oculus_rift/led_search.c',
 		'src/drv_oculus_rift/ohmd-video.c',
@@ -277,6 +278,18 @@ if _examples.contains('simple')
 	executable(
 		'openhmd_simple_example',
 		simple_sources,
+		c_args: publish_c_args,
+		include_directories: include_directories('./include'),
+		link_with: [openhmd_lib],
+		dependencies: deps,
+		install: true,
+	)
+
+	# High-rate CSV pose+velocity logger, for scoring forward prediction
+	# offline (tools/score_prediction.py in rift-cv1-center).
+	executable(
+		'openhmd_pose_log',
+		['examples/poselog/poselog.c'],
 		c_args: publish_c_args,
 		include_directories: include_directories('./include'),
 		link_with: [openhmd_lib],
