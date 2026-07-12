@@ -14,6 +14,7 @@
  */
 #include <assert.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "rift-fusion-ovr.h"
@@ -145,6 +146,19 @@ void rift_fusion_ovr_prepare_delay_slot(rift_fusion_ovr *f, uint64_t time, int d
 	f->slots[delay_slot].time_ns = time;
 	f->slots[delay_slot].pose = f->pose;
 	f->slots[delay_slot].lin_vel = f->lin_vel;
+
+	/* The slot time can be slightly ahead of the last integrated sample
+	 * (radio devices: the exposure lands between IMU arrivals) — advance
+	 * the snapshot by constant velocity so vision errors are computed
+	 * against the state AT the exposure, not before it */
+	if (f->have_time && time > f->time_ns) {
+		uint64_t gap = time - f->time_ns;
+		if (gap < 30000000ULL) {
+			vec3f adv;
+			ovec3f_multiply_scalar(&f->lin_vel, (float)(gap * 1e-9), &adv);
+			ovec3f_add(&f->slots[delay_slot].pose.pos, &adv, &f->slots[delay_slot].pose.pos);
+		}
+	}
 }
 
 void rift_fusion_ovr_release_delay_slot(rift_fusion_ovr *f, int delay_slot)
@@ -233,7 +247,29 @@ static void apply_tilt_correction(rift_fusion_ovr *f, float dt, float confidence
 	f->pose.orient = tmp;
 }
 
-/* OVR_SensorFusion.cpp applyVisionYawCorrection() */
+/* The 0.3.2-era SDK corrected tilt from the accelerometer alone and used
+ * vision for yaw only — fine for a head, but hand controllers experience
+ * sustained linear (centripetal) acceleration that masquerades as tilted
+ * gravity with LOW variance, so the accel path confidently locks the tilt
+ * up to ~10-15 deg wrong and yaw-only vision can never repair it (measured:
+ * constant per-run tilt offsets on Touch, grip/motion dependent, absent on
+ * the HMD). Correct the full vision orientation error instead: yaw as the
+ * SDK did, then the residual (tilt) with its own gain.
+ * OHMD_RIFT_NO_VISION_TILT=1 restores yaw-only behaviour for A/B. */
+#define VISION_TILT_GAIN 0.5f
+#define VISION_TILT_SNAP_THRESHOLD 0.15f
+
+static bool vision_tilt_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_VISION_TILT");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+/* OVR_SensorFusion.cpp applyVisionYawCorrection(), extended with tilt */
 static void apply_vision_yaw_correction(rift_fusion_ovr *f, float dt)
 {
 	quatf yaw_error, correction;
@@ -246,6 +282,25 @@ static void apply_vision_yaw_correction(rift_fusion_ovr *f, float dt)
 		quat_scale_rotation(&yaw_error, VISION_YAW_GAIN * dt, &correction);
 
 	apply_orient_correction(f, &correction);
+
+	if (!vision_tilt_enabled())
+		return;
+
+	/* apply_orient_correction() updated vision_error: what remains is the
+	 * unapplied yaw fraction plus the tilt. Strip the yaw again and treat
+	 * the residual as the tilt error. */
+	quatf yaw_rem, tilt_error, tilt_corr;
+	extract_yaw_rotation(&f->vision_error.orient, &yaw_rem);
+	oquatf_inverse(&yaw_rem);
+	oquatf_mult(&f->vision_error.orient, &yaw_rem, &tilt_error);
+	oquatf_normalize_me(&tilt_error);
+
+	if (quat_angle(&tilt_error) > VISION_TILT_SNAP_THRESHOLD)
+		tilt_corr = tilt_error;
+	else
+		quat_scale_rotation(&tilt_error, VISION_TILT_GAIN * dt, &tilt_corr);
+
+	apply_orient_correction(f, &tilt_corr);
 }
 
 /* OVR_SensorFusion.cpp applyPositionCorrection() */

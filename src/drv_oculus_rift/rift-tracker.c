@@ -95,6 +95,7 @@ struct rift_tracked_device_imu_observation {
 struct rift_tracker_pose_report {
 		bool report_used; /* TRUE if this report has been integrated */
 		bool orient_used; /* TRUE if the report's orientation was applied */
+		const char *source; /* serial of the sensor that produced it */
 		posef pose;
 		rift_pose_metrics score;
 		float obs_scale; /* confidence tier the report was integrated with */
@@ -119,6 +120,7 @@ struct rift_tracked_device_priv {
 	rift_tracked_device base;
 
 	int index; /* Index of this entry in the devices array for the tracker and exposures */
+	rift_tracker_ctx *tracker; /* owning tracker (for extrinsic refinement) */
 
 	ohmd_mutex *device_lock;
 
@@ -189,11 +191,38 @@ struct rift_tracked_device_priv {
 	FILE *debug_file;
 };
 
+/* Online extrinsic refinement (Oculus-runtime style). Whenever two cameras
+ * verify the SAME exposure of the HMD, their relative geometry error is a
+ * direct optical measurement M = pose_anchor o inv(pose_other) — the fused
+ * prior is NOT in the loop, so unlike the old servo-toward-fusion attempt
+ * this cannot random-walk. Sensor 0 stays fixed (anchors the world); the
+ * others are corrected toward agreement with it, slowly, and only when the
+ * headset has moved through enough space that per-camera PnP bias (which
+ * looks like a large phantom mismatch at static steep views) averages out. */
+typedef struct rift_extrinsic_refine {
+	int n_meas;
+	vec3f mean_dpos;    /* incremental mean of M position */
+	quatf mean_dorient; /* incremental slerp mean of M orientation */
+	vec3f span_min, span_max; /* HMD positions covered by this window */
+	vec3f fwd_sum;      /* sum of HMD floor-plane forward vectors: view
+	                     * diversity gate — per-camera PnP bias is view-
+	                     * dependent and only cancels across gaze angles */
+	uint64_t last_apply_ts;
+	uint64_t last_save_ts;
+	posef start_pose;   /* camera pose at first apply (net-drift telemetry) */
+	bool have_start;
+	double applied_pos_total; /* sum of applied step sizes (telemetry) */
+	double applied_ang_total;
+} rift_extrinsic_refine;
+
 struct rift_tracker_ctx_s
 {
 	ohmd_context* ohmd_ctx;
 	libusb_context *usb_ctx;
 	ohmd_mutex *tracker_lock;
+
+	ohmd_mutex *refine_lock;
+	rift_extrinsic_refine refine[RIFT_MAX_SENSORS];
 
 	ohmd_thread* usb_thread;
 	int usb_completed;
@@ -294,6 +323,127 @@ static bool obs_merge_enabled(void)
 	return enabled;
 }
 
+static bool extrinsic_refine_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_EXTRINSIC_REFINE");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+#define EXTRINSIC_REFINE_MIN_MEAS 100
+#define EXTRINSIC_REFINE_INTERVAL_NS 5000000000ULL
+#define EXTRINSIC_REFINE_MIN_SPAN_M 0.10f
+#define EXTRINSIC_REFINE_GAIN 0.15f
+#define EXTRINSIC_REFINE_MAX_POS_STEP 0.03f
+#define EXTRINSIC_REFINE_MAX_ANG_STEP DEG_TO_RAD(2.0f)
+/* dead-band: residual PnP-bias mismatch is < ~8 mm on this hardware while a
+ * real bumped sensor measures 10-100x that — don't chase the noise floor */
+#define EXTRINSIC_REFINE_DEADBAND_POS 0.008f
+#define EXTRINSIC_REFINE_DEADBAND_ANG DEG_TO_RAD(0.3f)
+/* |mean forward|/n <= cos(45deg/2): the window must span >= ~45 deg of gaze
+ * so view-dependent bias averages out instead of being chased */
+#define EXTRINSIC_REFINE_MAX_FWD_COHERENCE 0.92f
+
+/* Called with the device lock held, right after a new used pose report was
+ * stored for this exposure. If the exposure now carries strong LED-verified
+ * HMD observations from the anchor sensor (sensors[0]) AND another sensor,
+ * record their relative mismatch into that sensor's refinement window. */
+static void extrinsic_refine_measure(rift_tracked_device_priv *dev,
+	rift_tracker_pose_delay_slot *slot, rift_tracker_pose_report *newr)
+{
+	rift_tracker_ctx *ctx = dev->tracker;
+	int i;
+
+	if (!extrinsic_refine_enabled() || ctx == NULL || ctx->n_sensors < 2)
+		return;
+	if (dev->base.id != 0)
+		return; /* only the HMD constellation is rich enough to trust */
+	if (!POSE_HAS_FLAGS(&newr->score, RIFT_POSE_MATCH_STRONG | RIFT_POSE_MATCH_LED_IDS) ||
+	    newr->score.matched_blobs < 10 || newr->source == NULL)
+		return;
+
+	const char *anchor_serial = rift_sensor_serial_no(ctx->sensors[0]);
+
+	for (i = 0; i < slot->n_pose_reports; i++) {
+		rift_tracker_pose_report *other = slot->pose_reports + i;
+		rift_tracker_pose_report *anchor, *target;
+		int tidx = -1, s, k;
+
+		if (other == newr || !other->report_used || other->source == NULL)
+			continue;
+		if (strcmp(other->source, newr->source) == 0)
+			continue;
+		if (!POSE_HAS_FLAGS(&other->score, RIFT_POSE_MATCH_STRONG | RIFT_POSE_MATCH_LED_IDS) ||
+		    other->score.matched_blobs < 10)
+			continue;
+
+		/* exactly one of the pair must be the anchor sensor */
+		if (strcmp(newr->source, anchor_serial) == 0) {
+			anchor = newr;
+			target = other;
+		} else if (strcmp(other->source, anchor_serial) == 0) {
+			anchor = other;
+			target = newr;
+		} else
+			continue;
+
+		for (s = 1; s < ctx->n_sensors; s++) {
+			if (strcmp(rift_sensor_serial_no(ctx->sensors[s]), target->source) == 0) {
+				tidx = s;
+				break;
+			}
+		}
+		if (tidx < 0)
+			continue;
+
+		/* M = anchor_pose o inv(target_pose): the world-pose premultiplier
+		 * that would bring the target sensor into agreement */
+		posef M, inv = target->pose;
+		oposef_inverse(&inv);
+		oposef_apply(&inv, &anchor->pose, &M);
+
+		/* floor-plane gaze direction (LED-model +Z), for view diversity */
+		vec3f fwd_axis = {{ 0.0f, 0.0f, 1.0f }}, fwd;
+		oquatf_get_rotated(&anchor->pose.orient, &fwd_axis, &fwd);
+		fwd.y = 0.0f;
+		float fn = ovec3f_get_length(&fwd);
+		if (fn > 0.3f)
+			ovec3f_multiply_scalar(&fwd, 1.0f / fn, &fwd);
+		else
+			ovec3f_set(&fwd, 0, 0, 0); /* looking up/down: no yaw info */
+
+		ohmd_lock_mutex(ctx->refine_lock);
+		rift_extrinsic_refine *r = ctx->refine + tidx;
+		if (r->n_meas == 0) {
+			r->mean_dpos = M.pos;
+			r->mean_dorient = M.orient;
+			r->span_min = r->span_max = anchor->pose.pos;
+			r->fwd_sum = fwd;
+			r->n_meas = 1;
+		} else {
+			vec3f delta;
+			r->n_meas++;
+			ovec3f_subtract(&M.pos, &r->mean_dpos, &delta);
+			ovec3f_multiply_scalar(&delta, 1.0f / r->n_meas, &delta);
+			ovec3f_add(&r->mean_dpos, &delta, &r->mean_dpos);
+			oquatf_slerp(1.0f / r->n_meas, &r->mean_dorient, &M.orient, true, &r->mean_dorient);
+			oquatf_normalize_me(&r->mean_dorient);
+			ovec3f_add(&r->fwd_sum, &fwd, &r->fwd_sum);
+			for (k = 0; k < 3; k++) {
+				if (anchor->pose.pos.arr[k] < r->span_min.arr[k])
+					r->span_min.arr[k] = anchor->pose.pos.arr[k];
+				if (anchor->pose.pos.arr[k] > r->span_max.arr[k])
+					r->span_max.arr[k] = anchor->pose.pos.arr[k];
+			}
+		}
+		ohmd_unlock_mutex(ctx->refine_lock);
+		break;
+	}
+}
+
 /* Set OHMD_RIFT_NO_BLEED=1 to disable output correction bleeding (for A/B
  * testing): optical corrections then step the displayed pose directly. */
 static bool out_corr_enabled(void)
@@ -309,7 +459,7 @@ static bool out_corr_enabled(void)
 static void rift_tracked_device_send_imu_debug(rift_tracked_device_priv *dev);
 static void rift_tracked_device_send_debug_printf(rift_tracked_device_priv *dev, uint64_t local_ts, const char *fmt, ...);
 
-static void rift_tracked_device_on_new_exposure (rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info);
+static void rift_tracked_device_on_new_exposure (rift_tracked_device_priv *dev, uint64_t exposure_local_ts, rift_tracked_device_exposure_info *dev_info);
 static int rift_tracked_device_exposure_claim(rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info);
 static void rift_tracked_device_exposure_release_locked(rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info);
 
@@ -332,6 +482,7 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 	next_dev = ctx->devices + ctx->n_devices;
 
 	next_dev->base.id = device_id;
+	next_dev->tracker = ctx;
 	next_dev->n_delay_slots = ctx->n_sensors != 0 ? NUM_POSE_DELAY_SLOTS : 0;
 	rift_kalman_6dof_init(&next_dev->ukf_fusion, &init_pose, next_dev->n_delay_slots);
 	rift_fusion_ovr_init(&next_dev->ovr_fusion, &init_pose, next_dev->n_delay_slots);
@@ -426,6 +577,7 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	tracker_ctx = ohmd_alloc(ohmd_ctx, sizeof (rift_tracker_ctx));
 	tracker_ctx->ohmd_ctx = ohmd_ctx;
 	tracker_ctx->tracker_lock = ohmd_create_mutex(ohmd_ctx);
+	tracker_ctx->refine_lock = ohmd_create_mutex(ohmd_ctx);
 
 	rift_tracker_config_init(&tracker_ctx->config);
 	rift_tracker_config_load(ohmd_ctx, &tracker_ctx->config);
@@ -593,7 +745,7 @@ void rift_tracker_on_new_exposure (rift_tracker_ctx *ctx, uint32_t hmd_ts, uint1
 		dev_info->device_index = dev->index;
 
 		ohmd_lock_mutex (dev->device_lock);
-		rift_tracked_device_on_new_exposure(dev, dev_info);
+		rift_tracked_device_on_new_exposure(dev, now, dev_info);
 
 		rift_tracked_device_send_imu_debug(dev);
 
@@ -782,6 +934,7 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 		libusb_exit (tracker_ctx->usb_ctx);
 
 	ohmd_destroy_mutex (tracker_ctx->tracker_lock);
+	ohmd_destroy_mutex (tracker_ctx->refine_lock);
 	free (tracker_ctx);
 }
 
@@ -1379,6 +1532,7 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 
 			report->report_used = update_position;
 			report->orient_used = update_position && update_orientation;
+			report->source = source;
 			/* store the RAW observation (not the merged target) so later
 			 * same-exposure merges weight original measurements, and the
 			 * per-sensor confidence it was integrated with */
@@ -1389,6 +1543,9 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			if (update_position)
 				slot->n_used_reports++;
 			slot->n_pose_reports++;
+
+			if (update_position)
+				extrinsic_refine_measure(dev, slot, report);
 		}
 	}
 
@@ -1426,12 +1583,23 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 }
 
 /* Called with the device lock held */
-void rift_tracked_device_get_model_pose_locked(rift_tracked_device_priv *dev, uint32_t device_ts, posef *pose, vec3f *pos_error, vec3f *rot_error)
+void rift_tracked_device_get_model_pose_locked(rift_tracked_device_priv *dev, uint64_t device_ts, posef *pose, vec3f *pos_error, vec3f *rot_error)
 {
 	posef imu_global_pose, model_pose;
-	vec3f global_pos_error, global_rot_error;
+	vec3f global_pos_error, global_rot_error, vel;
 
-	fusion_get_pose_at(dev, dev->device_time_ns, &imu_global_pose, NULL, NULL, NULL, &global_pos_error, &global_rot_error);
+	fusion_get_pose_at(dev, dev->device_time_ns, &imu_global_pose, &vel, NULL, NULL, &global_pos_error, &global_rot_error);
+
+	/* The fusion state is only current as of the integration head;
+	 * extrapolate to the requested time (constant velocity, clamped) */
+	if (device_ts > dev->device_time_ns) {
+		uint64_t gap = device_ts - dev->device_time_ns;
+		if (gap < 30000000ULL) {
+			vec3f adv;
+			ovec3f_multiply_scalar(&vel, (float)(gap * 1e-9), &adv);
+			ovec3f_add(&imu_global_pose.pos, &adv, &imu_global_pose.pos);
+		}
+	}
 
 	/* Apply the pose conversion from IMU->model */
 	oposef_apply(&dev->model_from_fusion, &imu_global_pose, &model_pose);
@@ -1581,10 +1749,23 @@ get_matching_delay_slot(rift_tracked_device_priv *dev, rift_tracked_device_expos
 
 /* Called with the device lock held. Allocate a delay slot and populate the device exposure info */
 static void
-rift_tracked_device_on_new_exposure(rift_tracked_device_priv *dev, rift_tracked_device_exposure_info *dev_info) {
+rift_tracked_device_on_new_exposure(rift_tracked_device_priv *dev, uint64_t exposure_local_ts, rift_tracked_device_exposure_info *dev_info) {
 	rift_tracker_pose_delay_slot *slot = find_free_delay_slot(dev);
 
-	dev_info->device_time_ns = dev->device_time_ns;
+	/* Map the exposure moment onto this device's clock. The integration
+	 * head (device_time_ns) is only current as of the last IMU sample;
+	 * for radio-connected devices that sample is transport-latency old
+	 * (compensated in rift.c) and the exposure notification arrives later
+	 * still. Without this, every vision fix is applied to a state from
+	 * AFTER the exposure and drags the fused pose backward along the
+	 * motion vector (measured: fusion trails optics by v * ~10-15 ms). */
+	uint64_t device_time = dev->device_time_ns;
+	if (dev->last_imu_local_ts != 0 && exposure_local_ts > dev->last_imu_local_ts) {
+		uint64_t gap = exposure_local_ts - dev->last_imu_local_ts;
+		if (gap < 30000000ULL) /* sanity: ignore stale/sleeping streams */
+			device_time += gap;
+	}
+	dev_info->device_time_ns = device_time;
 
 	if (slot == NULL) {
 		/* We might reclaim a busy delay slot if some frame search is being slow and we already got an observation from another camera */
@@ -1607,7 +1788,7 @@ rift_tracked_device_on_new_exposure(rift_tracked_device_priv *dev, rift_tracked_
 	}
 	dev_info->last_acquired_pose_lock_ts = dev->last_acquired_pose_lock_ts;
 
-	rift_tracked_device_get_model_pose_locked(dev, dev->device_time_ns, &dev_info->capture_pose, &dev_info->pos_error, &dev_info->rot_error);
+	rift_tracked_device_get_model_pose_locked(dev, dev_info->device_time_ns, &dev_info->capture_pose, &dev_info->pos_error, &dev_info->rot_error);
 
 	if (slot) {
 		slot->device_time_ns = dev_info->device_time_ns;
@@ -1707,4 +1888,115 @@ void rift_tracker_update_sensor_pose(rift_tracker_ctx *tracker_ctx, rift_sensor_
 	rift_tracker_config_set_sensor_pose(&tracker_ctx->config, serial_no, new_pose);
 	rift_tracker_config_save(tracker_ctx->ohmd_ctx, &tracker_ctx->config);
 	ohmd_unlock_mutex (tracker_ctx->tracker_lock);
+}
+
+/* Called from a sensor's own analysis thread (no locks held) after each
+ * pose delivery: if its refinement window is ripe, take a damped clamped
+ * step of this sensor's camera pose toward agreement with the anchor.
+ * The window only applies when the HMD covered enough space that static
+ * PnP bias (which looks like a large phantom mismatch) has averaged out. */
+void rift_tracker_extrinsic_refine_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor)
+{
+	int idx = -1, i;
+	vec3f mean_pos;
+	quatf mean_orient;
+	bool have = false;
+
+	if (!extrinsic_refine_enabled() || ctx->n_sensors < 2)
+		return;
+	for (i = 1; i < ctx->n_sensors; i++) {
+		if (ctx->sensors[i] == sensor) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0)
+		return; /* the anchor sensor (index 0) is never refined */
+
+	uint64_t now = ohmd_monotonic_get(ctx->ohmd_ctx);
+	rift_extrinsic_refine *r = ctx->refine + idx;
+
+	ohmd_lock_mutex(ctx->refine_lock);
+	if (r->n_meas >= EXTRINSIC_REFINE_MIN_MEAS &&
+	    now - r->last_apply_ts >= EXTRINSIC_REFINE_INTERVAL_NS) {
+		vec3f span;
+		ovec3f_subtract(&r->span_max, &r->span_min, &span);
+		float coherence = ovec3f_get_length(&r->fwd_sum) / r->n_meas;
+		float mm = ovec3f_get_length(&r->mean_dpos);
+		float ma = 2.0f * acosf(OHMD_MIN(1.0f, fabsf(r->mean_dorient.w)));
+		if (ovec3f_get_length(&span) >= EXTRINSIC_REFINE_MIN_SPAN_M &&
+		    coherence <= EXTRINSIC_REFINE_MAX_FWD_COHERENCE &&
+		    (mm >= EXTRINSIC_REFINE_DEADBAND_POS ||
+		     ma >= EXTRINSIC_REFINE_DEADBAND_ANG)) {
+			mean_pos = r->mean_dpos;
+			mean_orient = r->mean_dorient;
+			have = true;
+		}
+		/* restart the window either way, so a stale static-geometry
+		 * accumulation can't linger and get applied much later */
+		r->n_meas = 0;
+		r->last_apply_ts = now;
+	}
+	ohmd_unlock_mutex(ctx->refine_lock);
+
+	if (!have)
+		return;
+
+	float dist = ovec3f_get_length(&mean_pos);
+	float t_pos = EXTRINSIC_REFINE_GAIN;
+	if (dist * t_pos > EXTRINSIC_REFINE_MAX_POS_STEP)
+		t_pos = EXTRINSIC_REFINE_MAX_POS_STEP / dist;
+
+	float ang = 2.0f * acosf(OHMD_MIN(1.0f, fabsf(mean_orient.w)));
+	float t_ang = EXTRINSIC_REFINE_GAIN;
+	if (ang > 0.0f && ang * t_ang > EXTRINSIC_REFINE_MAX_ANG_STEP)
+		t_ang = EXTRINSIC_REFINE_MAX_ANG_STEP / ang;
+
+	posef step, cur, newp;
+	quatf id = {{ 0.0, 0.0, 0.0, 1.0 }};
+	ovec3f_multiply_scalar(&mean_pos, t_pos, &step.pos);
+	oquatf_slerp(t_ang, &id, &mean_orient, true, &step.orient);
+	oquatf_normalize_me(&step.orient);
+
+	rift_sensor_get_pose(sensor, &cur);
+	oposef_apply(&cur, &step, &newp);
+	rift_sensor_set_pose(sensor, &newp);
+
+	bool save = false;
+	ohmd_lock_mutex(ctx->refine_lock);
+	if (!r->have_start) {
+		r->start_pose = cur;
+		r->have_start = true;
+	}
+	r->applied_pos_total += dist * t_pos;
+	r->applied_ang_total += ang * t_ang;
+	if (now - r->last_save_ts > 60000000000ULL) {
+		r->last_save_ts = now;
+		save = true;
+	}
+	double cum_pos = r->applied_pos_total, cum_ang = r->applied_ang_total;
+	posef start = r->start_pose;
+	ohmd_unlock_mutex(ctx->refine_lock);
+
+	/* net drift from the session-start pose: distinguishes one-way creep
+	 * (real correction) from oscillation (bias chasing) */
+	vec3f net_d;
+	quatf start_inv = start.orient, net_q;
+	ovec3f_subtract(&newp.pos, &start.pos, &net_d);
+	oquatf_inverse(&start_inv);
+	oquatf_mult(&newp.orient, &start_inv, &net_q);
+	float net_ang = 2.0f * acosf(OHMD_MIN(1.0f, fabsf(net_q.w)));
+
+	LOGI("extrinsic refine: sensor %s step %.1f mm / %.2f deg "
+		"(window mismatch %.1f mm / %.2f deg; net from start %.1f mm / %.2f deg; "
+		"summed steps %.1f mm / %.2f deg)",
+		rift_sensor_serial_no(sensor), dist * t_pos * 1000.0, RAD_TO_DEG(ang * t_ang),
+		dist * 1000.0, RAD_TO_DEG(ang),
+		ovec3f_get_length(&net_d) * 1000.0, RAD_TO_DEG(net_ang),
+		cum_pos * 1000.0, RAD_TO_DEG(cum_ang));
+
+	/* Persist the healed pose occasionally so it survives restarts.
+	 * NOTE: saved as-is (room offset is currently identity when set). */
+	if (save)
+		rift_tracker_update_sensor_pose(ctx, sensor, &newp);
 }
