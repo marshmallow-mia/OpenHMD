@@ -66,6 +66,7 @@ void oquatf_diff(const quatf* me, const quatf* q, quatf* out_q);
 void oquatf_normalize_me(quatf* me);
 float oquatf_get_length(const quatf* me);
 float oquatf_get_dot(const quatf* me, const quatf* q);
+void oquatf_slerp (float fT, const quatf* rkP, const quatf* rkQ, bool shortestPath, quatf* out_q);
 void oquatf_inverse(quatf* me);
 
 void oquatf_get_mat4x4(const quatf* me, const vec3f* point, float mat[4][4]);

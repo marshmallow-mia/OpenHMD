@@ -258,6 +258,57 @@ no_frame:
 	ohmd_unlock_mutex(sensor->sensor_lock);
 }
 
+/* OHMD_RIFT_SENSOR_STATS=1: per-sensor frame/blob rates, printed every 2 s.
+ *
+ * This sits UPSTREAM of the pose search, which is the point. The
+ * OHMD_RIFT_CAL_CAPTURE hook only records LED-ID-*verified* poses, so a sensor
+ * that sees the headset perfectly but fails to solve it (stale extrinsics, bad
+ * LED IDs) looks identical to a sensor pointed at a wall. Blob counts tell the
+ * two apart: blobs but no poses = a solving problem, no blobs = an aiming or
+ * streaming problem. */
+static void rift_sensor_stats(rift_sensor_ctx *sensor, int num_blobs)
+{
+	static int enabled = -1;
+	static struct {
+		uint64_t last_report;
+		uint32_t frames, frames_with_blobs, total_blobs;
+	} st[8];
+
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_SENSOR_STATS");
+		enabled = (e && atoi(e) != 0);
+	}
+	if (!enabled || sensor->id < 0 || sensor->id >= 8)
+		return;
+
+	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
+	int i = sensor->id;
+
+	st[i].frames++;
+	if (num_blobs > 0) {
+		st[i].frames_with_blobs++;
+		st[i].total_blobs += num_blobs;
+	}
+
+	if (st[i].last_report == 0)
+		st[i].last_report = now;
+
+	uint64_t dt = now - st[i].last_report;
+	if (dt >= 2000000000ULL) {
+		float secs = (float) dt * 1e-9f;
+		printf("[STATS] sensor %d %s: %5.1f frames/s | frames with blobs %5.1f%% "
+		       "| mean blobs when seen %4.1f\n",
+		       sensor->id, sensor->serial_no,
+		       st[i].frames / secs,
+		       st[i].frames ? 100.0f * st[i].frames_with_blobs / st[i].frames : 0.0f,
+		       st[i].frames_with_blobs ?
+		           (float) st[i].total_blobs / st[i].frames_with_blobs : 0.0f);
+		fflush(stdout);
+		st[i].last_report = now;
+		st[i].frames = st[i].frames_with_blobs = st[i].total_blobs = 0;
+	}
+}
+
 static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_frame *frame)
 {
 	uint64_t now = ohmd_monotonic_get(sensor->ohmd_ctx);
@@ -273,6 +324,8 @@ static void analyse_frame_fast(rift_sensor_ctx *sensor, rift_sensor_analysis_fra
 		frame->exposure_info.led_pattern_phase, NULL, 0, &frame->bwobs);
 
 	frame->blob_extract_finish_ts = ohmd_monotonic_get(sensor->ohmd_ctx);
+
+	rift_sensor_stats(sensor, frame->bwobs ? frame->bwobs->num_blobs : 0);
 
 	if (frame->bwobs && frame->bwobs->num_blobs > 0) {
 		rift_pose_finder_process_blobs_fast(&sensor->pf, frame, sensor->devices);
@@ -360,6 +413,7 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 	sensor_ctx->bw = blobwatch_new(calib->is_cv1 ? BLOB_THRESHOLD_CV1 : BLOB_THRESHOLD_DK2);
 
 	rift_pose_finder_init(&sensor_ctx->pf, calib, (rift_pose_finder_cb) handle_found_pose, sensor_ctx);
+	rift_cal_capture_register_sensor(id, serial_no, calib);
 
 	/* Raw debug video stream */
 	sensor_ctx->debug_vid_raw = ohmd_pw_video_stream_new (stream_id, "Rift Sensor", OHMD_PW_VIDEO_FORMAT_GRAY8,

@@ -818,9 +818,27 @@ void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time,
 	rift_kalman_6dof_update(state, time, m);
 }
 
-void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time, posef *pose, int delay_slot)
+void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time, posef *pose, int delay_slot, float obs_scale)
 {
 	ukf_measurement *m;
+	float orient_scale;
+
+	if (obs_scale < 1.0f)
+		obs_scale = 1.0f;
+	/* Orientation is barely trusted already (20-90 deg std dev), don't
+	 * inflate it as aggressively as position */
+	orient_scale = OHMD_MIN(obs_scale, 2.0f);
+
+	/* Scale the observation error covariance by the confidence in
+	 * this observation. Base values: 1cm position, 10/20/10 deg orientation.
+	 * X/Z (pitch/roll) are trusted strongly: the LED constellation anchors
+	 * them absolutely, while the IMU-only gravity estimate slowly breathes
+	 * +/-1 deg (accel bias random-walk), which reads as the world tilting. */
+	for (int i = 0; i < 3; i++)
+		MATRIX2D_XY(state->m2.R, i, i) = (0.01 * obs_scale) * (0.01 * obs_scale);
+	MATRIX2D_XY(state->m2.R, 3, 3) = (DEG_TO_RAD(10) * orient_scale) * (DEG_TO_RAD(10) * orient_scale);
+	MATRIX2D_XY(state->m2.R, 4, 4) = (DEG_TO_RAD(20) * orient_scale) * (DEG_TO_RAD(20) * orient_scale);
+	MATRIX2D_XY(state->m2.R, 5, 5) = (DEG_TO_RAD(10) * orient_scale) * (DEG_TO_RAD(10) * orient_scale);
 
 	/* Use lagged state vector entries to correct for delay */
 	state->pose_slot = delay_slot;
@@ -849,9 +867,14 @@ void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time,
 	rift_kalman_6dof_update(state, time, m);
 }
 
-void rift_kalman_6dof_position_update(rift_kalman_6dof_filter *state, uint64_t time, vec3f *pos, int delay_slot)
+void rift_kalman_6dof_position_update(rift_kalman_6dof_filter *state, uint64_t time, vec3f *pos, int delay_slot, float obs_scale)
 {
 	ukf_measurement *m;
+
+	if (obs_scale < 1.0f)
+		obs_scale = 1.0f;
+	for (int i = 0; i < 3; i++)
+		MATRIX2D_XY(state->m_position.R, i, i) = (0.01 * obs_scale) * (0.01 * obs_scale);
 
 	/* Use lagged state vector entries to correct for delay */
 	state->pose_slot = delay_slot;

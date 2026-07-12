@@ -264,7 +264,7 @@ void rift_evaluate_pose_with_prior (rift_pose_metrics *score, posef *pose,
 					rift_led *match_led = led_info->led;
 					int led_index = match_led->id;
 					if (b->led_id != LED_MAKE_ID (device_id, led_index)) {
-						printf("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d\n",
+						LOGD("mismatched LED id %d/%d blob %d (@ %f,%f) has %d/%d",
 						    device_id, led_index, i, b->x, b->y, device_id, LED_LOCAL_ID (b->led_id));
 						all_led_ids_matched = false;
 					}
@@ -425,7 +425,7 @@ void rift_mark_matching_blobs (posef *pose,
 		if (!led_info->matched) {
 			rift_led *match_led = led_info->led;
 			int led_index = match_led->id;
-			LOGI("No blob for device %d LED %d @ %f,%f size %f px angle %f", device_id, led_index, led_info->pos_px.x, led_info->pos_px.y,
+			LOGD("No blob for device %d LED %d @ %f,%f size %f px angle %f", device_id, led_index, led_info->pos_px.x, led_info->pos_px.y,
 			    2*led_info->led_radius_px, RAD_TO_DEG (acosf (led_info->facing_dot)));
 		}
 	}

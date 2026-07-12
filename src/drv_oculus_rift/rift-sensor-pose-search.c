@@ -28,6 +28,122 @@ static int update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_f
 	rift_tracked_device_exposure_info *exp_dev_info,
 	posef *obj_cam_pose);
 
+/*
+ * Offline-calibration observation capture.
+ *
+ * When OHMD_RIFT_CAL_CAPTURE names a file, every LED-ID-verified pose
+ * observation is appended there as one JSON line, along with one-time
+ * records of each sensor's intrinsics and each device's LED model.
+ * The offline solver groups observations from both sensors by exposure
+ * timestamp and jointly fits the camera extrinsics.
+ */
+#include <pthread.h>
+
+static pthread_mutex_t cal_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static FILE *cal_capture_file = NULL;
+static bool cal_capture_checked = false;
+
+/* Called with cal_capture_lock held */
+static FILE *cal_capture_get_file(void)
+{
+	if (!cal_capture_checked) {
+		const char *path = getenv("OHMD_RIFT_CAL_CAPTURE");
+		cal_capture_checked = true;
+		if (path && path[0] != '\0') {
+			cal_capture_file = fopen(path, "a");
+			if (cal_capture_file == NULL)
+				LOGE("Calibration capture: could not open %s", path);
+			else
+				LOGI("Calibration capture enabled -> %s", path);
+		}
+	}
+	return cal_capture_file;
+}
+
+void rift_cal_capture_register_sensor(int sensor_id, const char *serial,
+	const rift_sensor_camera_params *calib)
+{
+	pthread_mutex_lock(&cal_capture_lock);
+	FILE *f = cal_capture_get_file();
+	if (f) {
+		fprintf(f, "{\"t\":\"sensor\",\"s\":%d,\"serial\":\"%s\",\"w\":%d,\"h\":%d,"
+			"\"fisheye\":%d,\"K\":[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g],"
+			"\"dist\":[%.9g,%.9g,%.9g,%.9g,%.9g]}\n",
+			sensor_id, serial, calib->width, calib->height,
+			calib->dist_fisheye ? 1 : 0,
+			calib->camera_matrix.m[0], calib->camera_matrix.m[1], calib->camera_matrix.m[2],
+			calib->camera_matrix.m[3], calib->camera_matrix.m[4], calib->camera_matrix.m[5],
+			calib->camera_matrix.m[6], calib->camera_matrix.m[7], calib->camera_matrix.m[8],
+			calib->dist_coeffs[0], calib->dist_coeffs[1], calib->dist_coeffs[2],
+			calib->dist_coeffs[3], calib->dist_coeffs[4]);
+		fflush(f);
+	}
+	pthread_mutex_unlock(&cal_capture_lock);
+}
+
+void rift_cal_capture_register_leds(int device_id, const rift_leds *leds)
+{
+	pthread_mutex_lock(&cal_capture_lock);
+	FILE *f = cal_capture_get_file();
+	if (f) {
+		fprintf(f, "{\"t\":\"leds\",\"d\":%d,\"radius_mm\":%.6g,\"points\":[",
+			device_id, leds->radius_mm);
+		for (int i = 0; i < leds->num_points; i++) {
+			const rift_led *led = leds->points + i;
+			fprintf(f, "%s[%.7g,%.7g,%.7g,%.6g,%.6g,%.6g]", i ? "," : "",
+				led->pos.x, led->pos.y, led->pos.z,
+				led->dir.x, led->dir.y, led->dir.z);
+		}
+		fprintf(f, "]}\n");
+		fflush(f);
+	}
+	pthread_mutex_unlock(&cal_capture_lock);
+}
+
+void rift_cal_capture_obs(rift_pose_finder *pf, rift_sensor_analysis_frame *frame,
+	rift_tracked_device *dev, rift_sensor_frame_device_state *dev_state,
+	rift_tracked_device_exposure_info *exp_dev_info, const posef *obj_cam_pose)
+{
+	rift_pose_metrics *score = &dev_state->score;
+	const posef *wp = &exp_dev_info->capture_pose;
+	blobservation *bwobs = frame->bwobs;
+
+	pthread_mutex_lock(&cal_capture_lock);
+	FILE *f = cal_capture_get_file();
+	if (f) {
+		fprintf(f, "{\"t\":\"obs\",\"s\":%d,\"ts\":%" PRIu64 ",\"cnt\":%u,\"d\":%d,"
+			"\"flags\":%u,\"re\":%.5g,\"ge\":%.5g,\"pe\":[%.5g,%.5g,%.5g],"
+			"\"cam\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],"
+			"\"wp\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],"
+			"\"campose\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],\"blobs\":[",
+			pf->sensor_id, frame->exposure_info.local_ts,
+			(unsigned) frame->exposure_info.count, dev->id,
+			(unsigned) score->match_flags, score->reprojection_error,
+			dev_state->gravity_error_rad,
+			exp_dev_info->pos_error.x, exp_dev_info->pos_error.y, exp_dev_info->pos_error.z,
+			obj_cam_pose->pos.x, obj_cam_pose->pos.y, obj_cam_pose->pos.z,
+			obj_cam_pose->orient.x, obj_cam_pose->orient.y, obj_cam_pose->orient.z, obj_cam_pose->orient.w,
+			wp->pos.x, wp->pos.y, wp->pos.z,
+			wp->orient.x, wp->orient.y, wp->orient.z, wp->orient.w,
+			pf->camera_pose.pos.x, pf->camera_pose.pos.y, pf->camera_pose.pos.z,
+			pf->camera_pose.orient.x, pf->camera_pose.orient.y, pf->camera_pose.orient.z,
+			pf->camera_pose.orient.w);
+
+		int n_out = 0;
+		for (int i = 0; i < bwobs->num_blobs; i++) {
+			struct blob *b = bwobs->blobs + i;
+			if (LED_OBJECT_ID(b->led_id) != dev->id)
+				continue;
+			fprintf(f, "%s[%d,%.4f,%.4f]", n_out ? "," : "",
+				LED_LOCAL_ID(b->led_id), b->x, b->y);
+			n_out++;
+		}
+		fprintf(f, "]}\n");
+		fflush(f);
+	}
+	pthread_mutex_unlock(&cal_capture_lock);
+}
+
 void rift_pose_finder_init(rift_pose_finder *pf, rift_sensor_camera_params *calib,
 		rift_pose_finder_cb pose_cb, void *pose_cb_data)
 {
@@ -452,6 +568,15 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 		pf->have_camera_pose = true;
 		pf->camera_pose_changed = true;
 	}
+	/* NOTE: the camera pose is deliberately NOT refined online. An earlier
+	 * attempt servoed it toward the pose implied by the fused HMD prior,
+	 * but the prior is itself derived from the cameras, so the un-anchored
+	 * sensor pair random-walked. Extrinsics come from offline calibration
+	 * (capture with OHMD_RIFT_CAL_CAPTURE, solve, write room config) and
+	 * stay fixed for the whole session. */
+
+	if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS))
+		rift_cal_capture_obs(pf, frame, dev, dev_state, exp_dev_info, &pose);
 
 	if (!pf->have_camera_pose) {
 		LOGD("Sensor %d No camera pose yet - gravity error is %f degrees rot_error (%f, %f, %f). Not fusing pose for device %d",
