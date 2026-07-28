@@ -13,12 +13,18 @@
 #include "rift-sensor-blobwatch.h"
 
 #include "correspondence_search.h"
+#include "rift-joint-pose.h"
 
 typedef struct rift_pose_finder rift_pose_finder;
 
+/* `view` carries this sensor's LED correspondences for the exposure, as
+ * undistorted normalised rays, so the tracker can reconstruct one pose from
+ * every sensor that saw the device instead of averaging their separate
+ * solutions. NULL if the correspondence set could not be built. */
 typedef bool (*rift_pose_finder_cb) (void *cb_data,
 	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
-	posef *obj_world_pose, rift_pose_metrics *score);
+	posef *obj_world_pose, rift_pose_metrics *score,
+	const rift_joint_view *view);
 
 struct rift_pose_finder {
 	int sensor_id;

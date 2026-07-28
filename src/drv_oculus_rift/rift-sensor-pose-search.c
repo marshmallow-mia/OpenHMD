@@ -144,6 +144,50 @@ void rift_cal_capture_obs(rift_pose_finder *pf, rift_sensor_analysis_frame *fram
 	pthread_mutex_unlock(&cal_capture_lock);
 }
 
+/* Collect this device's labelled blobs for the exposure as undistorted
+ * normalised rays, paired with the LED index they were matched to. This is the
+ * per-sensor half of the joint reconstruction: the tracker pools these across
+ * sensors and solves one pose (see rift-joint-pose.h). */
+static bool build_joint_view(rift_pose_finder *pf, rift_sensor_analysis_frame *frame,
+	rift_tracked_device *dev, rift_joint_view *view)
+{
+	blobservation *bwobs = frame->bwobs;
+	struct blob picked[RIFT_JOINT_MAX_POINTS];
+	uint8_t led_index[RIFT_JOINT_MAX_POINTS];
+	vec3f rays[RIFT_JOINT_MAX_POINTS];
+	int n = 0;
+
+	if (bwobs == NULL || !pf->have_camera_pose)
+		return false;
+
+	for (int i = 0; i < bwobs->num_blobs && n < RIFT_JOINT_MAX_POINTS; i++) {
+		struct blob *b = bwobs->blobs + i;
+		if (LED_OBJECT_ID(b->led_id) != dev->id)
+			continue;
+		int local_id = LED_LOCAL_ID(b->led_id);
+		if (local_id < 0 || local_id >= dev->leds->num_points)
+			continue;
+		picked[n] = *b;
+		led_index[n] = (uint8_t) local_id;
+		n++;
+	}
+
+	if (n < 3)
+		return false;
+
+	undistort_points(picked, n, rays, pf->calib);
+
+	view->camera_pose = pf->camera_pose;
+	view->focal_px = (float) pf->calib->camera_matrix.m[0];
+	view->n_points = n;
+	for (int i = 0; i < n; i++) {
+		view->points[i].led_index = led_index[i];
+		view->points[i].ray[0] = rays[i].x;
+		view->points[i].ray[1] = rays[i].y;
+	}
+	return true;
+}
+
 void rift_pose_finder_init(rift_pose_finder *pf, rift_sensor_camera_params *calib,
 		rift_pose_finder_cb pose_cb, void *pose_cb_data)
 {
@@ -598,7 +642,13 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 
 	assert (pf->pose_cb != NULL);
 
-	if (pf->pose_cb (pf->pose_cb_data, dev, frame, &pose, score)) {
+	/* Hand the tracker this sensor's correspondences too, so it can solve one
+	 * pose across every sensor that saw this exposure (rift-joint-pose.c). */
+	rift_joint_view view;
+	bool have_view = build_joint_view(pf, frame, dev, &view);
+
+	if (pf->pose_cb (pf->pose_cb_data, dev, frame, &pose, score,
+			have_view ? &view : NULL)) {
 		dev_state->found_device_pose = true;
 		ret = score->matched_blobs;
 	}

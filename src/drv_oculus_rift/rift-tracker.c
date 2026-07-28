@@ -99,6 +99,10 @@ struct rift_tracker_pose_report {
 		posef pose;
 		rift_pose_metrics score;
 		float obs_scale; /* confidence tier the report was integrated with */
+		/* This sensor's LED correspondences for the exposure, so a later
+		 * report can reconstruct one pose across all of them */
+		bool have_view;
+		rift_joint_view view;
 };
 
 struct rift_tracker_pose_delay_slot {
@@ -121,6 +125,13 @@ struct rift_tracked_device_priv {
 
 	int index; /* Index of this entry in the devices array for the tracker and exposures */
 	rift_tracker_ctx *tracker; /* owning tracker (for extrinsic refinement) */
+
+	/* LED positions in the model frame, unpacked from base.leds so the joint
+	 * solver can take a plain vec3f array. Owned by this struct. */
+	vec3f *led_pos;
+	int n_led_pos;
+	/* Joint reconstruction telemetry */
+	uint32_t joint_solved, joint_rejected, joint_single;
 
 	ohmd_mutex *device_lock;
 
@@ -322,6 +333,31 @@ static bool obs_merge_enabled(void)
 	}
 	return enabled;
 }
+
+/* Joint multi-camera reconstruction: solve ONE pose from every sensor's LED
+ * correspondences for an exposure, instead of averaging the per-sensor poses.
+ * Each per-camera solution is already optimal in its own image and wrong in the
+ * other's, so their average is wrong in both - measured offline on recorded
+ * captures, the per-camera solutions fit their own camera to 0.09 px but
+ * reproject into the other at 5.6 px, and the merged pose sits at 2.8 px. The
+ * joint solve reaches 0.66 px in the worst camera and cuts frame-to-frame
+ * jitter 11x (rift-cv1-center/windows-vs-linux-tracking.md section 2).
+ * OHMD_RIFT_NO_JOINT_SOLVE=1 falls back to the weighted merge for A/B. */
+static bool joint_solve_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_JOINT_SOLVE");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+/* Oculus accepts a reconstruction at 2 px reprojection (their 2/715
+ * normalised, Rift.dll fcn.18017f370). Beyond that no single pose explains
+ * every camera's image, which means the extrinsics are wrong rather than the
+ * pose - measured sensitivity ~4.3 px per degree of camera rotation error. */
+#define JOINT_ACCEPT_PX 2.0f
 
 static bool extrinsic_refine_enabled(void)
 {
@@ -533,6 +569,14 @@ rift_tracker_add_device (rift_tracker_ctx *ctx, int device_id, posef *imu_pose, 
 
 	next_dev->base.leds = leds;
 	next_dev->base.led_search = led_search_model_new (leds);
+
+	/* Unpack the LED model into a plain vec3f array for the joint solver */
+	next_dev->led_pos = calloc(leds->num_points, sizeof(vec3f));
+	if (next_dev->led_pos != NULL) {
+		for (i = 0; i < leds->num_points; i++)
+			next_dev->led_pos[i] = leds->points[i].pos;
+		next_dev->n_led_pos = leds->num_points;
+	}
 	rift_cal_capture_register_leds (device_id, leds);
 	ctx->n_devices++;
 	ohmd_unlock_mutex (ctx->tracker_lock);
@@ -919,6 +963,8 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 		rift_tracked_device_priv *dev = tracker_ctx->devices + i;
 		if (dev->base.led_search)
 			led_search_model_free (dev->base.led_search);
+		free (dev->led_pos);
+		dev->led_pos = NULL;
 		if (dev->debug_metadata != NULL)
 			ohmd_pw_debug_stream_free (dev->debug_metadata);
 
@@ -1283,7 +1329,7 @@ bool rift_tracked_device_get_latest_exposure_info_pose (rift_tracked_device *dev
 }
 
 bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64_t local_ts, uint64_t frame_start_local_ts, rift_tracker_exposure_info *exposure_info,
-    rift_pose_metrics *score, posef *model_pose, const char *source)
+    rift_pose_metrics *score, posef *model_pose, const rift_joint_view *view, const char *source)
 {
 	rift_tracked_device_priv *dev = (rift_tracked_device_priv *) (dev_base);
 	uint64_t frame_device_time_ns = 0;
@@ -1435,7 +1481,55 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			float fusion_scale = obs_scale;
 			bool merged = false;
 
-			if (obs_merge_enabled() && slot->n_used_reports > 0) {
+			/* Preferred path: reconstruct ONE pose from every sensor's
+			 * correspondences for this exposure. Falls through to the
+			 * weighted merge when there is only one view, when the solve
+			 * fails, or when it cannot satisfy every camera - the last of
+			 * which means the extrinsics are wrong, not the pose. */
+			if (joint_solve_enabled() && view != NULL && dev->led_pos != NULL) {
+				rift_joint_view views[RIFT_MAX_SENSORS];
+				int n_views = 0;
+
+				for (int vi = 0; vi < slot->n_pose_reports && n_views < RIFT_MAX_SENSORS - 1; vi++) {
+					if (slot->pose_reports[vi].have_view)
+						views[n_views++] = slot->pose_reports[vi].view;
+				}
+
+				if (n_views > 0) {
+					posef joint_model;
+					rift_joint_result jres;
+
+					views[n_views++] = *view;
+
+					if (rift_joint_pose_solve(dev->led_pos, dev->n_led_pos,
+							views, n_views, model_pose, &joint_model, &jres)) {
+						if (jres.worst_view_px <= JOINT_ACCEPT_PX) {
+							oposef_apply(&dev->fusion_from_model, &joint_model, &fusion_target);
+							/* n independent views: the reconstruction is
+							 * correspondingly tighter than one sensor's */
+							fusion_scale = obs_scale / sqrtf((float) n_views);
+							merged = true;
+							dev->joint_solved++;
+						} else {
+							dev->joint_rejected++;
+							if ((dev->joint_rejected % 100) == 1) {
+								LOGI("Device %d: joint reconstruction over %d cameras left %.2f px "
+									"in the worst camera (>%.1f px) - check sensor calibration",
+									dev->base.id, n_views, jres.worst_view_px, JOINT_ACCEPT_PX);
+							}
+						}
+					}
+				} else {
+					dev->joint_single++;
+				}
+
+				if (merged && (dev->joint_solved % 300) == 1) {
+					LOGI("Device %d: joint reconstruction %u solved, %u rejected, %u single-camera",
+						dev->base.id, dev->joint_solved, dev->joint_rejected, dev->joint_single);
+				}
+			}
+
+			if (!merged && obs_merge_enabled() && slot->n_used_reports > 0) {
 				float w_sum = 1.0f / (obs_scale * obs_scale);
 				vec3f p_acc = imu_pose.pos;
 				ovec3f_multiply_scalar(&p_acc, w_sum, &p_acc);
@@ -1539,6 +1633,9 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 			report->pose = imu_pose;
 			report->score = *score;
 			report->obs_scale = obs_scale;
+			report->have_view = (view != NULL);
+			if (view != NULL)
+				report->view = *view;
 
 			if (update_position)
 				slot->n_used_reports++;

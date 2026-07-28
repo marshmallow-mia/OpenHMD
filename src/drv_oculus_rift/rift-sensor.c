@@ -363,7 +363,8 @@ static unsigned int fast_analysis_thread(void *arg);
 static unsigned int long_analysis_thread(void *arg);
 static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
-	posef *obj_world_pose, rift_pose_metrics *score);
+	posef *obj_world_pose, rift_pose_metrics *score,
+	const rift_joint_view *view);
 
 rift_sensor_ctx *
 rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
@@ -666,7 +667,8 @@ static unsigned int fast_analysis_thread(void *arg)
 
 static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
-	posef *obj_world_pose, rift_pose_metrics *score)
+	posef *obj_world_pose, rift_pose_metrics *score,
+	const rift_joint_view *view)
 {
 	uint64_t now = ohmd_monotonic_get(sensor_ctx->ohmd_ctx);
 	LOGD("Sensor %d TS %llu Updating fusion for device %d pose quat %f %f %f %f  pos %f %f %f",
@@ -675,7 +677,7 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 		obj_world_pose->pos.x, obj_world_pose->pos.y, obj_world_pose->pos.z);
 
 	bool ret = rift_tracked_device_model_pose_update(dev, now, frame->vframe->start_ts, &frame->exposure_info,
-	       score, obj_world_pose, sensor_ctx->serial_no);
+	       score, obj_world_pose, view, sensor_ctx->serial_no);
 
 	/* Online extrinsic refinement: apply any ripe correction for THIS
 	 * sensor from its own thread (no locks held here) */
