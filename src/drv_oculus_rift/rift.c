@@ -1222,16 +1222,27 @@ static int rift_get_led_info(rift_hmd_t *priv)
 		priv->leds.points[pkt.index].pattern = pattern;
 	}
 
-	/* FIXME: Filter out the LEDs on the back of the headset strap for now, until the positional tracking copes with the
-	 * device articulation. At the moment, a camera that sees the back LEDs will extract the wrong position.
-	 * Headset LEDs have a Z < -100mm */
+	/* The headset reports LEDs on the back of the strap as well as on the
+	 * visor, but the strap articulates relative to the visor, so they are not
+	 * one rigid body: a camera that sees the back LEDs and solves them against
+	 * the visor model extracts the wrong pose. They are dropped here (visor
+	 * LEDs sit at z > -100 mm).
+	 *
+	 * The Oculus runtime keeps them and reconstructs the back group as its OWN
+	 * rigid body - Rift.dll validates the split ("Expected %d / %d front /
+	 * back LEDs, but found %d / %d") and reconstructs it through the same
+	 * routine as the visor ("Back of head reconstruction failed. Reprojection
+	 * error: %f", "Back of head tracking status"). That is what it would take
+	 * to use them, and it is why tracking degrades when the user faces away
+	 * from the sensors: everything behind the head is being thrown away.
+	 * See rift-cv1-center/windows-vs-linux-tracking.md section 8 item 7. */
 	{
 		int in_index, out_index = 0;
 		for (in_index = 0; in_index < priv->leds.num_points; in_index++) {
 			rift_led *led = &priv->leds.points[in_index];
 			if (led->pos.z < -0.1) {
-				printf ("Dropping headband LED { .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x },\n",
-					led->pos.x, led->pos.y, led->pos.z,
+				LOGV ("Dropping headband LED %d { .pos = {%f,%f,%f}, .dir={%f,%f,%f}, .pattern=0x%x }",
+					in_index, led->pos.x, led->pos.y, led->pos.z,
 					led->dir.x, led->dir.y, led->dir.z,
 					led->pattern);
 				continue;
@@ -1239,6 +1250,11 @@ static int rift_get_led_info(rift_hmd_t *priv)
 			if (in_index != out_index)
 				priv->leds.points[out_index] = *led;
 			out_index++;
+		}
+		if (out_index != priv->leds.num_points) {
+			LOGI ("Using %d visor LEDs; dropped %d headband LEDs (not tracked as a "
+				"separate body yet - the headset is only trackable from the front)",
+				out_index, priv->leds.num_points - out_index);
 		}
 		priv->leds.num_points = out_index;
 	}
