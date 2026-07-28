@@ -865,6 +865,21 @@ void rift_kalman_6dof_prepare_delay_slot(rift_kalman_6dof_filter *state, uint64_
 	state->reset_slot = -1;
 }
 
+void rift_kalman_6dof_notify_camera_moved(rift_kalman_6dof_filter *state,
+	double pos_var, double rot_var)
+{
+	int i;
+
+	for (i = COV_POSITION; i < COV_POSITION + 3; i++) {
+		if (MATRIX2D_XY(state->ukf.P_prior, i, i) < pos_var)
+			MATRIX2D_XY(state->ukf.P_prior, i, i) = pos_var;
+	}
+	for (i = COV_ORIENTATION; i < COV_ORIENTATION + 3; i++) {
+		if (MATRIX2D_XY(state->ukf.P_prior, i, i) < rot_var)
+			MATRIX2D_XY(state->ukf.P_prior, i, i) = rot_var;
+	}
+}
+
 void rift_kalman_6dof_release_delay_slot(rift_kalman_6dof_filter *state, int delay_slot)
 {
 	int base = BASE_COV_SIZE + (DELAY_SLOT_COV_SIZE * delay_slot);

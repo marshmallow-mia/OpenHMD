@@ -84,6 +84,11 @@ void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state);
 void rift_kalman_6dof_prepare_delay_slot(rift_kalman_6dof_filter *state, uint64_t time, int delay_slot);
 void rift_kalman_6dof_release_delay_slot(rift_kalman_6dof_filter *state, int delay_slot);
 
+/* A sensor's extrinsics changed: the state was conditioned on the old ones, so
+ * widen the pose uncertainty and let the next observations re-establish it. */
+void rift_kalman_6dof_notify_camera_moved(rift_kalman_6dof_filter *state,
+	double pos_var, double rot_var);
+
 /* accel_saturated: the accelerometer clipped; its measurement noise is
  * inflated for this sample instead of being taken at face value. */
 void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field, bool accel_saturated);

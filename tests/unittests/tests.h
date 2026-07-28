@@ -61,6 +61,7 @@ void test_rift_kalman_two_sample_rates();
 void test_rift_kalman_delayed_position_update();
 void test_rift_fusion_ovr_saturated_accel_ignored();
 void test_rift_kalman_rejects_non_finite_imu();
+void test_rift_fusion_ovr_camera_moved();
 
 // OpenCV geometry regression tests
 void test_opencv_fisheye_roundtrip();
