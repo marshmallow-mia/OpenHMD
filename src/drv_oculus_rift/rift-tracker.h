@@ -37,6 +37,12 @@ bool rift_tracked_device_get_latest_exposure_info_pose (rift_tracked_device *dev
  * When two or more sensors supply one for the same exposure, the tracker
  * reconstructs a single pose from all of them instead of averaging their
  * separate solutions - see rift-joint-pose.h. */
+/* Accelerometer-derived gravity direction in the device MODEL frame, for
+ * gravity alignment. Vision plays no part in it, so it is an independent
+ * reference for how the room frame relates to true up. False if unavailable
+ * (not warmed up, or a fusion backend that does not track it). */
+bool rift_tracked_device_get_gravity_model(rift_tracked_device *dev_base, vec3f *out);
+
 bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64_t local_ts, uint64_t frame_start_local_ts, rift_tracker_exposure_info *exposure_info, rift_pose_metrics *score, posef *pose, const rift_joint_view *view, const char *source);
 void rift_tracked_device_frame_release (rift_tracked_device *dev_base, rift_tracker_exposure_info *info);
 

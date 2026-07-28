@@ -1328,6 +1328,27 @@ bool rift_tracked_device_get_latest_exposure_info_pose (rift_tracked_device *dev
 	return res;
 }
 
+bool rift_tracked_device_get_gravity_model(rift_tracked_device *dev_base, vec3f *out)
+{
+	rift_tracked_device_priv *dev = (rift_tracked_device_priv *) (dev_base);
+	vec3f grav_fusion;
+	bool ret = false;
+
+	ohmd_lock_mutex (dev->device_lock);
+	if (use_ovr_fusion() && rift_fusion_ovr_get_gravity_body(&dev->ovr_fusion, &grav_fusion)) {
+		/* the filter works in the fusion (IMU) frame; the capture and the
+		 * optical solve are both in the model frame */
+		quatf model_from_fusion = dev->fusion_from_model.orient;
+		oquatf_inverse(&model_from_fusion);
+		oquatf_get_rotated(&model_from_fusion, &grav_fusion, out);
+		ovec3f_normalize_me(out);
+		ret = true;
+	}
+	ohmd_unlock_mutex (dev->device_lock);
+
+	return ret;
+}
+
 bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64_t local_ts, uint64_t frame_start_local_ts, rift_tracker_exposure_info *exposure_info,
     rift_pose_metrics *score, posef *model_pose, const rift_joint_view *view, const char *source)
 {
