@@ -38,7 +38,10 @@ if not dep_libusb.found()
 	dep_libusb = proj_hidapi.get_variable('libusb_dep')
 endif
 dep_threads = dependency('threads')
-dep_opencv = dependency('opencv4', required: false)
+dep_opencv = dependency('opencv5', required: false)
+if not dep_opencv.found()
+	dep_opencv = dependency('opencv4', required: false)
+endif
 if not dep_opencv.found()
 	# On Windows, search via cmake
         dep_opencv = dependency('opencv', method: 'cmake', modules: ['opencv_core'])
@@ -368,7 +371,8 @@ if get_option('tests')
 		'tests/unittests/tests.h',
 		'tests/unittests/vec.c',
 		'tests/unittests/pose.c',
-		'tests/unittests/joint_pose.c'
+		'tests/unittests/joint_pose.c',
+		'tests/unittests/opencv_geometry.c'
 	]
 
 	unittests = executable(

@@ -55,6 +55,10 @@ void test_rift_joint_pose_two_cameras_beat_one();
 void test_rift_joint_pose_detects_bad_extrinsics();
 void test_rift_joint_pose_rejects_thin_data();
 
+// OpenCV geometry regression tests
+void test_opencv_fisheye_roundtrip();
+void test_opencv_estimate_initial_pose();
+
 // high-level tests
 void test_highlevel_open_close_device();
 void test_highlevel_open_close_many_devices();
