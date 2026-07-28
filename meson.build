@@ -136,6 +136,7 @@ if _drivers.contains('rift')
 		'src/drv_oculus_rift/sensor/esp570.c',
 		'src/drv_oculus_rift/sensor/esp770u.c',
 		'src/drv_oculus_rift/sensor/uvc.c',
+		'src/drv_oculus_rift/rift-joint-pose.c',
 		'src/drv_oculus_rift/rift-tracker.c',
 		'src/drv_oculus_rift/rift-tracker-config.c',
 		'src/drv_oculus_rift/rift-kalman-6dof.c',
@@ -359,13 +360,15 @@ openhmd_dep = declare_dependency(
 if get_option('tests')
 	unittests_sources = [
 		'src/omath.c',
+		'src/drv_oculus_rift/rift-joint-pose.c',
 		'tests/unittests/highlevel.c',
 		'tests/unittests/main.c',
 		'tests/unittests/mat4x4.c',
 		'tests/unittests/quat.c',
 		'tests/unittests/tests.h',
 		'tests/unittests/vec.c',
-		'tests/unittests/pose.c'
+		'tests/unittests/pose.c',
+		'tests/unittests/joint_pose.c'
 	]
 
 	unittests = executable(

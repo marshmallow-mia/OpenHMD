@@ -49,6 +49,12 @@ void test_oposef_init();
 void test_oposef_inverse();
 void test_oposef_apply();
 
+// joint multi-camera pose reconstruction tests
+void test_rift_joint_pose_exact();
+void test_rift_joint_pose_two_cameras_beat_one();
+void test_rift_joint_pose_detects_bad_extrinsics();
+void test_rift_joint_pose_rejects_thin_data();
+
 // high-level tests
 void test_highlevel_open_close_device();
 void test_highlevel_open_close_many_devices();

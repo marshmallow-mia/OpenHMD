@@ -41,6 +41,15 @@ int main()
 	Test(test_oposef_inverse);
 	Test(test_oposef_apply);
 
+	printf("\n");
+
+	printf("joint pose tests\n");
+	Test(test_rift_joint_pose_exact);
+	Test(test_rift_joint_pose_two_cameras_beat_one);
+	Test(test_rift_joint_pose_detects_bad_extrinsics);
+	Test(test_rift_joint_pose_rejects_thin_data);
+	printf("\n");
+
 	printf("high level tests\n");
 	Test(test_highlevel_open_close_device);
 	Test(test_highlevel_open_close_many_devices);
