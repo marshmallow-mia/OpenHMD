@@ -59,6 +59,14 @@ int main()
 	Test(test_rift_fusion_ovr_camera_moved);
 	printf("\n");
 
+	printf("sync monitor tests\n");
+	Test(test_rift_sync_monitor_clean_stream);
+	Test(test_rift_sync_monitor_repeated_exposure);
+	Test(test_rift_sync_monitor_dropped_exposure);
+	Test(test_rift_sync_monitor_latency_outlier);
+	Test(test_rift_sync_monitor_late_pose);
+	printf("\n");
+
 	printf("opencv geometry tests\n");
 	Test(test_opencv_fisheye_roundtrip);
 	Test(test_opencv_estimate_initial_pose);

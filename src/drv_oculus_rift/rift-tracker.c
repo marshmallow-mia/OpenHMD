@@ -23,6 +23,7 @@
 #include "rift-fusion-ovr.h"
 #include "rift-tracker.h"
 #include "rift-tracker-config.h"
+#include "rift-sync-monitor.h"
 #include "rift-sensor.h"
 #include "rift-sensor-usb.h"
 
@@ -133,6 +134,7 @@ struct rift_tracked_device_priv {
 	/* Joint reconstruction telemetry */
 	uint32_t joint_solved, joint_rejected, joint_single;
 	uint32_t imu_saturated_samples;
+	rift_sync_monitor sync;
 
 	ohmd_mutex *device_lock;
 
@@ -236,6 +238,9 @@ struct rift_tracker_ctx_s
 	ohmd_context* ohmd_ctx;
 	libusb_context *usb_ctx;
 	ohmd_mutex *tracker_lock;
+
+	/* exposure/frame timing health (rift-sync-monitor.h) */
+	rift_sync_monitor sync;
 
 	ohmd_mutex *refine_lock;
 	rift_extrinsic_refine refine[RIFT_MAX_SENSORS];
@@ -803,6 +808,23 @@ void rift_tracker_on_new_exposure (rift_tracker_ctx *ctx, uint32_t hmd_ts, uint1
 
 	uint64_t now = ohmd_monotonic_get(ctx->ohmd_ctx);
 
+	/* Timing health: the HMD re-announcing an exposure, or a gap where one
+	 * should have been, both mean the vision timebase is stuttering. */
+	{
+		int64_t delta_ns = 0;
+		if (rift_sync_monitor_exposure(&ctx->sync, exposure_count, now, &delta_ns)) {
+			if ((ctx->sync.repeated_exposures % 100) == 1)
+				LOGW("Repeated exposure time: count %u seen again (%u so far)",
+					exposure_count, ctx->sync.repeated_exposures);
+		} else if (rift_sync_monitor_exposure_gap(delta_ns)) {
+			if ((ctx->sync.dropped_exposures % 100) == 1)
+				LOGW("Exposure stream out of sync: gap of %.1f ms (nominal %.1f ms), "
+					"%u so far", delta_ns / 1000000.0,
+					RIFT_SYNC_NOMINAL_EXPOSURE_NS / 1000000.0,
+					ctx->sync.dropped_exposures);
+		}
+	}
+
 	info->local_ts = now;
 	info->count = exposure_count;
 	info->hmd_ts = exposure_hmd_ts;
@@ -865,6 +887,7 @@ rift_tracker_frame_captured (rift_tracker_ctx *ctx, uint64_t local_ts, uint64_t 
 	bool have_exposure_info = false;
 	int64_t best_abs_ns = INT64_MAX;
 	int64_t best_diff_ns = 0;
+	int64_t matched_latency_ns = 0;
 
 	for (i = 0; i < ctx->exposure_history_size; i++) {
 		rift_tracker_exposure_info *info = ctx->exposure_history + i;
@@ -875,8 +898,24 @@ rift_tracker_frame_captured (rift_tracker_ctx *ctx, uint64_t local_ts, uint64_t 
 			best_diff_ns = time_diff_ns;
 			if (abs_ns < 10000000) {
 				have_exposure_info = true;
+				matched_latency_ns = time_diff_ns;
 				*out_info = *info;
 			}
+		}
+	}
+
+	/* Timing health: how long after its exposure this frame turned up. A
+	 * frame that lands far from what the stream has been doing means the
+	 * camera and the HMD have drifted apart - the runtime blames the sync
+	 * cable in so many words. */
+	if (have_exposure_info) {
+		int64_t predicted_ns = 0;
+		if (rift_sync_monitor_frame(&ctx->sync, matched_latency_ns, &predicted_ns) &&
+		    (ctx->sync.latency_outliers % 100) == 1) {
+			LOGW("Sensor %s: predicted exposure-to-frame latency of %.1f ms differed "
+				"from measured %.1f ms (%u so far) - check the sensor sync cable",
+				source, predicted_ns / 1000000.0, matched_latency_ns / 1000000.0,
+				ctx->sync.latency_outliers);
 		}
 	}
 
@@ -1425,6 +1464,17 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 	/* This device existed when the exposure was taken and therefore has info */
 	rift_tracked_device_exposure_info *dev_info = exposure_info->devices + dev->index;
 	frame_device_time_ns = dev_info->device_time_ns;
+
+	/* Timing health: how stale this fix is by the time it lands. */
+	if (dev->device_time_ns > frame_device_time_ns) {
+		uint64_t age_ns = dev->device_time_ns - frame_device_time_ns;
+		if (rift_sync_monitor_pose_age(&dev->sync, age_ns) &&
+		    (dev->sync.late_poses % 100) == 1) {
+			LOGW("Device %d: late pose time %.3f ms from %s (%u so far, worst %.3f ms)",
+				dev->base.id, age_ns / 1000000.0, source, dev->sync.late_poses,
+				dev->sync.worst_pose_age_ns / 1000000.0);
+		}
+	}
 
 	slot = get_matching_delay_slot(dev, dev_info);
 	if (slot != NULL) {
