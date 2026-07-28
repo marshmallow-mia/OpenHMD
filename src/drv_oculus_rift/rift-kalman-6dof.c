@@ -25,6 +25,14 @@
 #define HYBRID_MOTION_THRESHOLD (3 / 1000.0)
 
 /* IMU biases noise levels */
+/* Measured accelerometer noise, see the R setup in rift_kalman_6dof_init */
+#define IMU_ACCEL_NOISE (0.05 * 0.05) /* (m/s^2)^2 */
+
+/* Covariance held on a delay slot that is not in use. Its state is pinned to
+ * identity/zero, so the value is arbitrary - it only has to be positive, so
+ * that P stays positive definite. */
+#define DELAY_SLOT_UNUSED_COV 1.0
+
 #define IMU_GYRO_BIAS_NOISE 1e-17 /* gyro bias (rad/s)^2 */
 #define IMU_GYRO_BIAS_NOISE_INITIAL 1e-3 /* gyro bias (rad/s)^2 */
 #define IMU_ACCEL_BIAS_NOISE 1e-16 /* accelerometer bias (m/s^2)^2 */
@@ -711,9 +719,16 @@ void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int
 	/* m1 is for IMU measurement - accel */
 	ukf_measurement_init(&state->m1, 3, 3, &state->ukf, imu_measurement_func, NULL, NULL, NULL);
 
-	/* FIXME: Set R matrix to something based on IMU noise */
+	/* Accelerometer measurement noise. This was 1e-6 - a 1 mm/s^2 standard
+	 * deviation - under a FIXME, which told the filter to believe the
+	 * accelerometer almost absolutely. Measured from the raw 1 kHz IMU stream
+	 * of a real CV1 (tools/measure_imu_noise.py over the quietest windows of
+	 * captures/win/2026-07-12/imu_tracking.pcap): per-axis sigma 0.035-0.047
+	 * m/s^2, i.e. a variance around 2.2e-3, some 2000x the old value. Those
+	 * windows still contain a little real motion, so this is an upper bound;
+	 * 0.05 m/s^2 is the round number just above it. */
 	for (int i = 0; i < 3; i++)
-	 MATRIX2D_XY(state->m1.R, i, i) = 1e-6;
+	 MATRIX2D_XY(state->m1.R, i, i) = IMU_ACCEL_NOISE;
 
 	/* m2 is for pose measurements - position and orientation. We trust the position more than
 	 * the orientation. */
@@ -738,6 +753,7 @@ void rift_kalman_6dof_init(rift_kalman_6dof_filter *state, posef *init_pose, int
 
 void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state)
 {
+	ukf_measurement_clear(&state->m_position);
 	ukf_measurement_clear(&state->m2);
 	ukf_measurement_clear(&state->m1);
 	ukf_base_clear(&state->ukf);
@@ -796,7 +812,24 @@ void rift_kalman_6dof_prepare_delay_slot(rift_kalman_6dof_filter *state, uint64_
 
 void rift_kalman_6dof_release_delay_slot(rift_kalman_6dof_filter *state, int delay_slot)
 {
+	int base = BASE_COV_SIZE + (DELAY_SLOT_COV_SIZE * delay_slot);
+	int i, j;
+
 	state->slot_inuse[delay_slot] = false;
+
+	/* A released slot carries no information, and state_mean_func pins its
+	 * state to identity/zero. Its covariance rows must be given back a
+	 * non-zero, uncorrelated value or P becomes singular and the next
+	 * Cholesky fails - which is exactly what happened once process noise
+	 * stopped being added on zero-dt calls, since that addition had been
+	 * quietly propping these rows up. */
+	for (i = 0; i < DELAY_SLOT_COV_SIZE; i++) {
+		for (j = 0; j < state->ukf.N_cov; j++) {
+			MATRIX2D_XY(state->ukf.P_prior, base + i, j) = 0.0;
+			MATRIX2D_XY(state->ukf.P_prior, j, base + i) = 0.0;
+		}
+		MATRIX2D_XY(state->ukf.P_prior, base + i, base + i) = DELAY_SLOT_UNUSED_COV;
+	}
 }
 
 void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field)
@@ -816,6 +849,7 @@ void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time,
 	MATRIX2D_Y(m->z, IMU_MEAS_ACCEL+2) = accel->z;
 
 	rift_kalman_6dof_update(state, time, m);
+	state->pose_slot = -1;
 }
 
 void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time, posef *pose, int delay_slot, float obs_scale)
@@ -865,6 +899,7 @@ void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time,
 
 	state->saw_pose_update = true;
 	rift_kalman_6dof_update(state, time, m);
+	state->pose_slot = -1;
 }
 
 void rift_kalman_6dof_position_update(rift_kalman_6dof_filter *state, uint64_t time, vec3f *pos, int delay_slot, float obs_scale)
@@ -881,8 +916,15 @@ void rift_kalman_6dof_position_update(rift_kalman_6dof_filter *state, uint64_t t
 
 	/* If doing a delayed update, then the slot must be in use (
 	 * or else it contains empty data */
-	if (delay_slot != -1)
+	if (delay_slot != -1) {
 		assert(state->slot_inuse[delay_slot]);
+		/* Same as the pose path: the delay slot already carries the delay,
+		 * so the update must not also advance (or rewind) the filter clock.
+		 * Without this a position-only delayed fix ran a predict over the
+		 * gap between the exposure and now, on top of the lag the slot was
+		 * there to represent. */
+		time = 0;
+	}
 
 	m = &state->m_position;
 	MATRIX2D_Y(m->z, POSE_MEAS_POSITION+0) = pos->x;
@@ -890,6 +932,7 @@ void rift_kalman_6dof_position_update(rift_kalman_6dof_filter *state, uint64_t t
 	MATRIX2D_Y(m->z, POSE_MEAS_POSITION+2) = pos->z;
 
 	rift_kalman_6dof_update(state, time, m);
+	state->pose_slot = -1;
 }
 
 /* Get the pose info from a delay slot, or the main state

@@ -55,6 +55,11 @@ void test_rift_joint_pose_two_cameras_beat_one();
 void test_rift_joint_pose_detects_bad_extrinsics();
 void test_rift_joint_pose_rejects_thin_data();
 
+// 6DOF UKF tests
+void test_rift_kalman_stationary();
+void test_rift_kalman_two_sample_rates();
+void test_rift_kalman_delayed_position_update();
+
 // OpenCV geometry regression tests
 void test_opencv_fisheye_roundtrip();
 void test_opencv_estimate_initial_pose();
