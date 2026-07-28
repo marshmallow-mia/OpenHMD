@@ -3,11 +3,13 @@
  * Copyright 2015 Philipp Zabel
  * SPDX-License-Identifier:	LGPL-2.0+ or BSL-1.0
  */
-#include <opencv2/calib3d/calib3d.hpp>
-#include <opencv2/imgproc/imgproc.hpp>
-#if CV_MAJOR_VERSION >= 4
-#include <opencv2/calib3d/calib3d_c.h>
-#endif
+/* OpenCV 5 split calib3d into geometry/stereo/calib and dropped the
+ * <module>/<module>.hpp layout; opencv2/calib3d.hpp survives there as a
+ * backward-compatibility umbrella and exists in OpenCV 3/4 as well, so these
+ * flat includes work across all three. The legacy C header
+ * (calib3d/calib3d_c.h) is gone in OpenCV 5 and nothing here needed it. */
+#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
 #include <iostream>
 
 using namespace std;
@@ -326,10 +328,14 @@ extern "C" bool refine_pose(struct blob *blobs, int num_blobs,
 		cv::undistortPoints(list_points2d, list_points2d_undistorted, cameraK, distCoeffs);
 	}
 
-// OpenCV 3.4.7 introduced a method to go straight to refining the pose with LM:
-#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 3 && CV_VERSION_MINOR > 4) || (CV_VERSION_MAJOR == 3 && CV_VERSION_MINOR == 4 && CV_VERSION_REVISION >= 7) 
-	if (!cv::solvePnPRefineLM (list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec))
-		return false;
+// OpenCV 3.4.7 introduced a method to go straight to refining the pose with LM.
+// Note the guard below omits OpenCV 4 entirely (`> 4 || == 3 && ...`), so 4.x
+// took the solvePnP path; the branch only became live on OpenCV 5, which
+// exposed that solvePnPRefineLM returns void and cannot be tested with `!`.
+// Left as-is other than dropping the bogus test: refine_pose() has no callers,
+// so widening the guard would change nothing except which dead branch compiles.
+#if CV_VERSION_MAJOR > 4 || (CV_VERSION_MAJOR == 3 && CV_VERSION_MINOR > 4) || (CV_VERSION_MAJOR == 3 && CV_VERSION_MINOR == 4 && CV_VERSION_REVISION >= 7)
+	cv::solvePnPRefineLM (list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec);
 #else
 	if (!cv::solvePnP(list_points3d, list_points2d_undistorted, dummyK, dummyD, rvec, tvec,
 			   true, flags))

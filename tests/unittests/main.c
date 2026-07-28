@@ -50,6 +50,11 @@ int main()
 	Test(test_rift_joint_pose_rejects_thin_data);
 	printf("\n");
 
+	printf("opencv geometry tests\n");
+	Test(test_opencv_fisheye_roundtrip);
+	Test(test_opencv_estimate_initial_pose);
+	printf("\n");
+
 	printf("high level tests\n");
 	Test(test_highlevel_open_close_device);
 	Test(test_highlevel_open_close_many_devices);
