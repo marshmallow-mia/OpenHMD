@@ -69,8 +69,10 @@ void rift_fusion_ovr_clear(rift_fusion_ovr *f);
 void rift_fusion_ovr_prepare_delay_slot(rift_fusion_ovr *f, uint64_t time, int delay_slot);
 void rift_fusion_ovr_release_delay_slot(rift_fusion_ovr *f, int delay_slot);
 
+/* accel_saturated: the accelerometer clipped, so its DIRECTION is wrong and it
+ * must not be used to correct tilt this sample. */
 void rift_fusion_ovr_imu_update(rift_fusion_ovr *f, uint64_t time,
-	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag);
+	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag, bool accel_saturated);
 
 /* replace_pending: this fix is a merged re-statement of the current
  * exposure's earlier fix(es) — it must overwrite the pending vision error

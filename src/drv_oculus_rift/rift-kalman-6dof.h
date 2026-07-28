@@ -84,7 +84,9 @@ void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state);
 void rift_kalman_6dof_prepare_delay_slot(rift_kalman_6dof_filter *state, uint64_t time, int delay_slot);
 void rift_kalman_6dof_release_delay_slot(rift_kalman_6dof_filter *state, int delay_slot);
 
-void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field);
+/* accel_saturated: the accelerometer clipped; its measurement noise is
+ * inflated for this sample instead of being taken at face value. */
+void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field, bool accel_saturated);
 /* obs_scale scales the observation error std-dev: 1.0 = fully trusted
  * (1cm position error), larger = weaker correction */
 void rift_kalman_6dof_pose_update(rift_kalman_6dof_filter *state, uint64_t time, posef *pose, int delay_slot, float obs_scale);

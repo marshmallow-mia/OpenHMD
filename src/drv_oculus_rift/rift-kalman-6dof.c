@@ -27,6 +27,9 @@
 /* IMU biases noise levels */
 /* Measured accelerometer noise, see the R setup in rift_kalman_6dof_init */
 #define IMU_ACCEL_NOISE (0.05 * 0.05) /* (m/s^2)^2 */
+/* Saturated: the true value is somewhere past the rail, so this sample says
+ * almost nothing. 10 m/s^2 of sigma is "ignore me". */
+#define IMU_ACCEL_SATURATED_NOISE (10.0 * 10.0)
 
 /* Covariance held on a delay slot that is not in use. Its state is pinned to
  * identity/zero, so the value is arbitrary - it only has to be positive, so
@@ -759,6 +762,41 @@ void rift_kalman_6dof_clear(rift_kalman_6dof_filter *state)
 	ukf_base_clear(&state->ukf);
 }
 
+static bool rift_kalman_6dof_state_is_finite(rift_kalman_6dof_filter *state)
+{
+	for (int i = 0; i < state->ukf.N_state; i++) {
+		if (!isfinite(MATRIX2D_Y(state->ukf.x_prior, i)))
+			return false;
+	}
+	return true;
+}
+
+/* Last resort when the state itself has gone bad: keep whatever is still
+ * finite, drop everything derived, and re-seed the covariance. */
+static void rift_kalman_6dof_reset_state(rift_kalman_6dof_filter *state)
+{
+	int i;
+
+	for (i = 0; i < state->ukf.N_state; i++) {
+		if (!isfinite(MATRIX2D_Y(state->ukf.x_prior, i)))
+			MATRIX2D_Y(state->ukf.x_prior, i) = 0.0;
+	}
+
+	/* a zeroed quaternion is not a rotation */
+	if (MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION) == 0.0 &&
+	    MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION+1) == 0.0 &&
+	    MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION+2) == 0.0 &&
+	    MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION+3) == 0.0) {
+		MATRIX2D_Y(state->ukf.x_prior, STATE_ORIENTATION+3) = 1.0;
+	}
+
+	for (i = STATE_VELOCITY; i < BASE_STATE_SIZE; i++)
+		MATRIX2D_Y(state->ukf.x_prior, i) = 0.0;
+
+	rift_kalman_6dof_reinit(state);
+	state->first_update = true;
+}
+
 static void
 rift_kalman_6dof_update(rift_kalman_6dof_filter *state, uint64_t time, ukf_measurement *m)
 {
@@ -776,14 +814,31 @@ rift_kalman_6dof_update(rift_kalman_6dof_filter *state, uint64_t time, ukf_measu
 	}
 
 	if (!ukf_base_predict(&state->ukf, NS_TO_SEC(dt))) {
-			LOGE ("Failed to compute UKF prediction at time %llu (dt %f)", (unsigned long long) state->current_ts, NS_TO_SEC(dt));
+			/* Almost always a Cholesky failure, i.e. P has stopped being
+			 * positive definite. Carrying on would keep feeding a corrupt
+			 * covariance forward; re-seed it instead. Oculus treats the same
+			 * condition as an event worth naming ("EKF: P not positive
+			 * definite") rather than something to ride through. */
+			LOGE ("Failed to compute UKF prediction at time %llu (dt %f) - resetting covariance",
+				(unsigned long long) state->current_ts, NS_TO_SEC(dt));
+			rift_kalman_6dof_reinit(state);
 			return;
 	}
 
 	if (m) {
 		if (!ukf_base_update(&state->ukf, m)) {
-			LOGE ("Failed to perform %s UKF update at time %llu (dt %f)",
+			LOGE ("Failed to perform %s UKF update at time %llu (dt %f) - resetting covariance",
 						m == &state->m1 ? "IMU" : "Pose", (unsigned long long) state->current_ts, NS_TO_SEC(dt));
+			rift_kalman_6dof_reinit(state);
+			return;
+		}
+
+		/* A non-finite state cannot be recovered by further updates and would
+		 * propagate into every pose the driver reports. */
+		if (!rift_kalman_6dof_state_is_finite(state)) {
+			LOGE ("UKF state went non-finite after %s update at time %llu - reinitialising",
+						m == &state->m1 ? "IMU" : "Pose", (unsigned long long) state->current_ts);
+			rift_kalman_6dof_reset_state(state);
 			return;
 		}
 	}
@@ -832,8 +887,15 @@ void rift_kalman_6dof_release_delay_slot(rift_kalman_6dof_filter *state, int del
 	}
 }
 
-void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field)
+void rift_kalman_6dof_imu_update (rift_kalman_6dof_filter *state, uint64_t time, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field, bool accel_saturated)
 {
+	/* A clipped reading is not a measurement of anything; widen its noise so
+	 * it barely moves the state rather than pulling it to the rail. Oculus
+	 * does the same, logging the inflated sigma while saturation lasts. */
+	const double accel_r = accel_saturated ? IMU_ACCEL_SATURATED_NOISE : IMU_ACCEL_NOISE;
+	for (int i = 0; i < 3; i++)
+		MATRIX2D_XY(state->m1.R, i, i) = accel_r;
+
 	ukf_measurement *m;
 
 	/* Put angular velocity into the input vector to update the orientation */

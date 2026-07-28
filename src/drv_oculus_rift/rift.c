@@ -264,6 +264,48 @@ static void apply_imu_calibration(const float mat[3][3], const vec3f *offset,
 	}
 }
 
+/* Fraction of a rail at which a reading is treated as clipped. Slightly under
+ * 1 so a value sitting exactly at full scale, or dithering just below it, is
+ * caught too. */
+#define SATURATION_FRACTION 0.98f
+
+/* The HMD packs each axis as 21-bit signed at 1e-4 units, so the wire format
+ * itself rails at +/-(2^20 - 1) counts however the sensor is configured. */
+#define HMD_WIRE_RAIL 1048575
+
+/* Per-axis saturation test for the HMD's raw integer samples. The sensor's own
+ * full-scale range comes from the RANGE feature report, which the driver has
+ * always decoded and never used; fall back to the wire rail if it looks
+ * unset. */
+static rift_imu_sample_flags hmd_sample_saturation(rift_hmd_t *priv, const int32_t accel[3], const int32_t gyro[3])
+{
+	rift_imu_sample_flags flags = RIFT_IMU_SAMPLE_OK;
+	int32_t accel_limit = HMD_WIRE_RAIL, gyro_limit = HMD_WIRE_RAIL;
+	int i;
+
+	if (priv->sensor_range.accel_scale > 0) {
+		/* accel_scale is full scale in g */
+		int32_t l = (int32_t)(priv->sensor_range.accel_scale * OHMD_GRAVITY_EARTH / 1e-4);
+		if (l > 0 && l < accel_limit)
+			accel_limit = l;
+	}
+	if (priv->sensor_range.gyro_scale > 0) {
+		/* gyro_scale is full scale in degrees/sec */
+		int32_t l = (int32_t)(priv->sensor_range.gyro_scale * M_PI / 180.0 / 1e-4);
+		if (l > 0 && l < gyro_limit)
+			gyro_limit = l;
+	}
+
+	for (i = 0; i < 3; i++) {
+		if (abs(accel[i]) >= (int32_t)(SATURATION_FRACTION * accel_limit))
+			flags |= RIFT_IMU_ACCEL_SATURATED;
+		if (abs(gyro[i]) >= (int32_t)(SATURATION_FRACTION * gyro_limit))
+			flags |= RIFT_IMU_GYRO_SATURATED;
+	}
+
+	return flags;
+}
+
 static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsigned char* buffer, int size)
 {
 	if (buffer[0] == RIFT_IRQ_SENSORS_DK1
@@ -325,7 +367,8 @@ static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsig
 				accel = raw_accel;
 		}
 
-		rift_tracked_device_imu_update(priv->tracked_dev, local_ts, device_ts, TICK_US_TO_SEC(dt), &gyro, &accel, &raw_mag);
+		rift_tracked_device_imu_update(priv->tracked_dev, local_ts, device_ts, TICK_US_TO_SEC(dt), &gyro, &accel, &raw_mag,
+			hmd_sample_saturation(priv, s->samples[i].accel, s->samples[i].gyro));
 
 		device_ts += dt;
 		local_ts += TICK_US_TO_NS(dt);
@@ -485,7 +528,17 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 	apply_imu_calibration(c->gyro_matrix, &c->gyro_offset, &raw_gyro, &gyro);
 	apply_imu_calibration(c->accel_matrix, &c->accel_offset, &raw_accel, &accel);
 
-	rift_tracked_device_imu_update(touch->tracked_dev, local_ts, device_ts, dt_s, &gyro, &accel, &mag);
+	/* Touch reports each axis as int16, so the rail is the type's own limit:
+	 * +/-16 g on the accelerometer and +/-2000 deg/s on the gyro. */
+	rift_imu_sample_flags sat = RIFT_IMU_SAMPLE_OK;
+	for (int a = 0; a < 3; a++) {
+		if (abs(msg->touch.accel[a]) >= (int)(SATURATION_FRACTION * 32767))
+			sat |= RIFT_IMU_ACCEL_SATURATED;
+		if (abs(msg->touch.gyro[a]) >= (int)(SATURATION_FRACTION * 32767))
+			sat |= RIFT_IMU_GYRO_SATURATED;
+	}
+
+	rift_tracked_device_imu_update(touch->tracked_dev, local_ts, device_ts, dt_s, &gyro, &accel, &mag, sat);
 	touch->last_timestamp = msg->touch.timestamp;
 	touch->time_valid = true;
 

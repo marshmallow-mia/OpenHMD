@@ -27,7 +27,19 @@ void rift_tracker_frame_release (rift_tracker_ctx *ctx, uint64_t local_ts, uint6
 
 void rift_tracker_free (rift_tracker_ctx *ctx);
 
-void rift_tracked_device_imu_update(rift_tracked_device *dev, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field);
+/* Per-sample IMU health. A saturated axis is not a measurement - the true
+ * value is somewhere beyond the rail - so the fusion must stop trusting it
+ * rather than integrate the clipped number. Oculus tracks the same two
+ * conditions and inflates the corresponding sigma while they last
+ * ("Begin Gyro saturation: %.4f, orient sigma %.2f", "Acc saturation: %d
+ * samples, pos sigma %.1f"). */
+typedef enum {
+	RIFT_IMU_SAMPLE_OK = 0,
+	RIFT_IMU_ACCEL_SATURATED = (1 << 0),
+	RIFT_IMU_GYRO_SATURATED = (1 << 1),
+} rift_imu_sample_flags;
+
+void rift_tracked_device_imu_update(rift_tracked_device *dev, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field, rift_imu_sample_flags flags);
 void rift_tracked_device_get_view_pose(rift_tracked_device *dev, posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel);
 uint64_t rift_tracked_device_get_pose_age_ns(rift_tracked_device *dev, uint64_t now_local_ts);
 
