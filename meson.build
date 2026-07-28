@@ -140,6 +140,7 @@ if _drivers.contains('rift')
 		'src/drv_oculus_rift/sensor/esp770u.c',
 		'src/drv_oculus_rift/sensor/uvc.c',
 		'src/drv_oculus_rift/rift-joint-pose.c',
+		'src/drv_oculus_rift/rift-sync-monitor.c',
 		'src/drv_oculus_rift/rift-tracker.c',
 		'src/drv_oculus_rift/rift-tracker-config.c',
 		'src/drv_oculus_rift/rift-kalman-6dof.c',
@@ -364,6 +365,7 @@ if get_option('tests')
 	unittests_sources = [
 		'src/omath.c',
 		'src/drv_oculus_rift/rift-joint-pose.c',
+		'src/drv_oculus_rift/rift-sync-monitor.c',
 		'tests/unittests/highlevel.c',
 		'tests/unittests/main.c',
 		'tests/unittests/mat4x4.c',
@@ -373,7 +375,8 @@ if get_option('tests')
 		'tests/unittests/pose.c',
 		'tests/unittests/joint_pose.c',
 		'tests/unittests/opencv_geometry.c',
-		'tests/unittests/kalman_6dof.c'
+		'tests/unittests/kalman_6dof.c',
+		'tests/unittests/sync_monitor.c'
 	]
 
 	unittests = executable(

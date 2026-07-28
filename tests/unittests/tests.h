@@ -63,6 +63,13 @@ void test_rift_fusion_ovr_saturated_accel_ignored();
 void test_rift_kalman_rejects_non_finite_imu();
 void test_rift_fusion_ovr_camera_moved();
 
+// exposure/frame/pose timing monitor
+void test_rift_sync_monitor_clean_stream();
+void test_rift_sync_monitor_repeated_exposure();
+void test_rift_sync_monitor_dropped_exposure();
+void test_rift_sync_monitor_latency_outlier();
+void test_rift_sync_monitor_late_pose();
+
 // OpenCV geometry regression tests
 void test_opencv_fisheye_roundtrip();
 void test_opencv_estimate_initial_pose();
