@@ -50,6 +50,12 @@ int main()
 	Test(test_rift_joint_pose_rejects_thin_data);
 	printf("\n");
 
+	printf("kalman 6dof tests\n");
+	Test(test_rift_kalman_stationary);
+	Test(test_rift_kalman_two_sample_rates);
+	Test(test_rift_kalman_delayed_position_update);
+	printf("\n");
+
 	printf("opencv geometry tests\n");
 	Test(test_opencv_fisheye_roundtrip);
 	Test(test_opencv_estimate_initial_pose);

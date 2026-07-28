@@ -84,7 +84,17 @@ bool ukf_base_predict_with_process(ukf_base *u, double dt, ukf_process_fn proces
 
   /* Add the additive process noise before prediction, so it is
    * already incorporated in the prediction, and we don't need
-   * to re-draw points after */
+   * to re-draw points after.
+   *
+   * NOTE: Q is added whole on every call rather than scaled by dt, so the
+   * effective process noise depends on the call rate (1000x/second at the IMU
+   * rate) and a zero-dt call injects a full step for no elapsed time. That is
+   * wrong in principle. Scaling by dt was tried and reverted: it makes the
+   * covariance of released delay slots collapse and the next Cholesky
+   * factorisation fail, because this unconditional addition has been quietly
+   * keeping P positive definite. Fixing it properly means giving the delay
+   * slots a correct covariance of their own first - see
+   * rift-cv1-center/windows-vs-linux-tracking.md section 7. */
   if (u->Q) {
     if (matrix2d_add_in_place (u->P_prior, u->Q) != MATRIX_RESULT_OK) {
       return false;

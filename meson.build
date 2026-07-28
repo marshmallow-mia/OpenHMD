@@ -372,7 +372,8 @@ if get_option('tests')
 		'tests/unittests/vec.c',
 		'tests/unittests/pose.c',
 		'tests/unittests/joint_pose.c',
-		'tests/unittests/opencv_geometry.c'
+		'tests/unittests/opencv_geometry.c',
+		'tests/unittests/kalman_6dof.c'
 	]
 
 	unittests = executable(

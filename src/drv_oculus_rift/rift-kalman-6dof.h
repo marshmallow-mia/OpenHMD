@@ -19,25 +19,28 @@
 typedef struct rift_kalman_6dof_filter rift_kalman_6dof_filter;
 
 struct rift_kalman_6dof_filter {
-  /* 22 element state vector:
+  /* 19 element state vector, 18 covariance dimensions (the quaternion costs
+   * 4 state entries but only 3 of covariance, parameterised by an exponential
+   * map). Authoritative layout is the STATE_ and COV_ defines in the .c.
+   *
    * Inertial frame:
    *  quatd orientation (quaternion) (0:3)
-   *
    *  vec3d position (4:6)
-   *  vec3d velocity; (7:9)
-   *  vec3d accel; (10:12)
+   *  vec3d velocity (7:9)
+   *  vec3d accel (10:12)
    *
    * Body frame:
-   *  vec3d angular_velocity (13:15)
+   *  vec3d accel-bias (13:15)
+   *  vec3d gyro-bias (16:18)
    *
-   *  vec3d accel-bias; (16:18)
-   *  vec3d gyro-bias (19:21)
+   *  + N lagged slots, each 7 state / 6 covariance:
+   *    quatd orientation (0:3)
+   *    vec3d position (4:6)
    *
-   *  + N lagged slots each:
-   *    quatf orientation (quaternion) (0:3)
-   *    vec3f position (4:6)
-   *
-   */
+   * Angular velocity is NOT a state - it is the control input, taken straight
+   * from the gyro (see `ang_vel` below and process_func in the .c). An earlier
+   * version of this comment listed it as states 13:15 and put the biases at
+   * 16:21, which never matched the code. */
   /* ukf_base needs to be the first element in the struct */
   ukf_base ukf;
 
