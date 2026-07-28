@@ -108,6 +108,13 @@ void rift_cal_capture_obs(rift_pose_finder *pf, rift_sensor_analysis_frame *fram
 	const posef *wp = &exp_dev_info->capture_pose;
 	blobservation *bwobs = frame->bwobs;
 
+	/* Accelerometer-derived gravity in the model frame. Independent of vision
+	 * and of the room config, so an offline solver can use it to check how the
+	 * room frame relates to true up (tools/replay_recon.py gravity). Zero when
+	 * unavailable. */
+	vec3f grav = {{ 0.0f, 0.0f, 0.0f }};
+	rift_tracked_device_get_gravity_model(dev, &grav);
+
 	pthread_mutex_lock(&cal_capture_lock);
 	FILE *f = cal_capture_get_file();
 	if (f) {
@@ -115,7 +122,8 @@ void rift_cal_capture_obs(rift_pose_finder *pf, rift_sensor_analysis_frame *fram
 			"\"flags\":%u,\"re\":%.5g,\"ge\":%.5g,\"pe\":[%.5g,%.5g,%.5g],"
 			"\"cam\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],"
 			"\"wp\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],"
-			"\"campose\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],\"blobs\":[",
+			"\"campose\":[%.7g,%.7g,%.7g,%.7g,%.7g,%.7g,%.7g],"
+			"\"grav\":[%.6g,%.6g,%.6g],\"blobs\":[",
 			pf->sensor_id, frame->exposure_info.local_ts,
 			(unsigned) frame->exposure_info.count, dev->id,
 			(unsigned) score->match_flags, score->reprojection_error,
@@ -127,7 +135,8 @@ void rift_cal_capture_obs(rift_pose_finder *pf, rift_sensor_analysis_frame *fram
 			wp->orient.x, wp->orient.y, wp->orient.z, wp->orient.w,
 			pf->camera_pose.pos.x, pf->camera_pose.pos.y, pf->camera_pose.pos.z,
 			pf->camera_pose.orient.x, pf->camera_pose.orient.y, pf->camera_pose.orient.z,
-			pf->camera_pose.orient.w);
+			pf->camera_pose.orient.w,
+			grav.x, grav.y, grav.z);
 
 		int n_out = 0;
 		for (int i = 0; i < bwobs->num_blobs; i++) {

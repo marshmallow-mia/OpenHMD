@@ -82,6 +82,12 @@ void rift_fusion_ovr_position_update(rift_fusion_ovr *f, uint64_t time,
 
 void rift_fusion_ovr_get_delay_slot_pose_at(rift_fusion_ovr *f, uint64_t time, int delay_slot,
 	posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel, vec3f *pos_error, vec3f *rot_error);
+/* The accelerometer-derived gravity direction in the CURRENT BODY FRAME, as
+ * low-passed by the tilt-correction filter. This is pure accelerometer - no
+ * vision - which is what makes it usable as an independent reference for
+ * gravity alignment. Returns false before the filter has warmed up. */
+bool rift_fusion_ovr_get_gravity_body(rift_fusion_ovr *f, vec3f *out);
+
 void rift_fusion_ovr_get_pose_at(rift_fusion_ovr *f, uint64_t time,
 	posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel, vec3f *pos_error, vec3f *rot_error);
 

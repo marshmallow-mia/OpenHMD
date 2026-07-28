@@ -496,6 +496,14 @@ static void error_estimates(rift_fusion_ovr *f, uint64_t time,
 	}
 }
 
+bool rift_fusion_ovr_get_gravity_body(rift_fusion_ovr *f, vec3f *out)
+{
+	if (!f->grav_init || f->grav_warmup < 1.0f)
+		return false;
+	*out = f->grav_filter;
+	return true;
+}
+
 void rift_fusion_ovr_get_delay_slot_pose_at(rift_fusion_ovr *f, uint64_t time, int delay_slot,
 	posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel, vec3f *pos_error, vec3f *rot_error)
 {
