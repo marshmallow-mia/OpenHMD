@@ -517,6 +517,12 @@ static void error_estimates(rift_fusion_ovr *f, uint64_t time,
 	}
 }
 
+void rift_fusion_ovr_notify_camera_moved(rift_fusion_ovr *f)
+{
+	f->have_vision_error = false;
+	f->snap_pending = true;
+}
+
 bool rift_fusion_ovr_get_gravity_body(rift_fusion_ovr *f, vec3f *out)
 {
 	if (!f->grav_init || f->grav_warmup < 1.0f)

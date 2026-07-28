@@ -217,3 +217,68 @@ void test_rift_kalman_rejects_non_finite_imu()
 
 	rift_kalman_6dof_clear(&f);
 }
+
+/* When a sensor's extrinsics are corrected, every fix taken through it was
+ * computed against a world that has since moved. The fusion has to be told, or
+ * it blends the new (correct) fix with its stale pending error and barely
+ * moves. A/B over a 50 mm extrinsic correction. */
+static float camera_moved_residual_mm(bool notify)
+{
+	const vec3f accel = {{ 0.0f, (float)GRAVITY, 0.0f }};
+	const vec3f gyro = {{ 0.0f, 0.0f, 0.0f }};
+	posef a, b, out;
+	vec3f vel, acc, ang_vel, d;
+	rift_fusion_ovr f;
+	uint64_t t = 0;
+	int i;
+
+	ovec3f_set(&a.pos, 0.0f, 1.2f, -1.3f);
+	oquatf_set(&a.orient, 0.0f, 0.0f, 0.0f, 1.0f);
+	b = a;
+	b.pos.x += 0.05f;
+
+	rift_fusion_ovr_init(&f, &a, 3);
+
+	for (i = 1; i <= 2000; i++) {           /* settle on the old extrinsics */
+		t = (uint64_t)i * 1000000ULL;
+		rift_fusion_ovr_imu_update(&f, t, &gyro, &accel, NULL, false);
+		if (i % 20 == 0) {
+			int s = (i / 20) % 3;
+			rift_fusion_ovr_prepare_delay_slot(&f, t, s);
+			rift_fusion_ovr_pose_update(&f, t, &a, s, 1.0f, false);
+			rift_fusion_ovr_release_delay_slot(&f, s);
+		}
+	}
+
+	if (notify)
+		rift_fusion_ovr_notify_camera_moved(&f);
+
+	for (i = 2001; i <= 2020; i++) {
+		t = (uint64_t)i * 1000000ULL;
+		rift_fusion_ovr_imu_update(&f, t, &gyro, &accel, NULL, false);
+	}
+	rift_fusion_ovr_prepare_delay_slot(&f, t, 0);
+	rift_fusion_ovr_pose_update(&f, t, &b, 0, 1.0f, false);
+	rift_fusion_ovr_release_delay_slot(&f, 0);
+	for (i = 2021; i <= 2040; i++) {
+		t = (uint64_t)i * 1000000ULL;
+		rift_fusion_ovr_imu_update(&f, t, &gyro, &accel, NULL, false);
+	}
+
+	rift_fusion_ovr_get_pose_at(&f, t, &out, &vel, &acc, &ang_vel, NULL, NULL);
+	ovec3f_subtract(&out.pos, &b.pos, &d);
+	rift_fusion_ovr_clear(&f);
+
+	return ovec3f_get_length(&d) * 1000.0f;
+}
+
+void test_rift_fusion_ovr_camera_moved()
+{
+	float without = camera_moved_residual_mm(false);
+	float with = camera_moved_residual_mm(true);
+
+	/* untold, the filter is still most of the 50 mm away */
+	TAssert(without > 20.0f);
+	/* told, it takes the corrected fix in full */
+	TAssert(with < 1.0f);
+}

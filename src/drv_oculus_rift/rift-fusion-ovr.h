@@ -82,6 +82,11 @@ void rift_fusion_ovr_pose_update(rift_fusion_ovr *f, uint64_t time,
 void rift_fusion_ovr_position_update(rift_fusion_ovr *f, uint64_t time,
 	vec3f *position, int delay_slot, float obs_scale, bool replace_pending);
 
+/* A sensor's extrinsics changed, so every vision fix taken through it was
+ * computed against a world that has since moved. Drop the pending error and
+ * take the next fix in full rather than blending it with a stale one. */
+void rift_fusion_ovr_notify_camera_moved(rift_fusion_ovr *f);
+
 void rift_fusion_ovr_get_delay_slot_pose_at(rift_fusion_ovr *f, uint64_t time, int delay_slot,
 	posef *pose, vec3f *vel, vec3f *accel, vec3f *ang_vel, vec3f *pos_error, vec3f *rot_error);
 /* The accelerometer-derived gravity direction in the CURRENT BODY FRAME, as

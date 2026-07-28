@@ -223,6 +223,10 @@ typedef struct rift_extrinsic_refine {
 	uint64_t last_save_ts;
 	posef start_pose;   /* camera pose at first apply (net-drift telemetry) */
 	bool have_start;
+	/* Calibration settle state: unsettled while refinement is still moving
+	 * this sensor, settled after enough consecutive quiet evaluations. */
+	bool settled;
+	int quiet_rounds;
 	double applied_pos_total; /* sum of applied step sizes (telemetry) */
 	double applied_ang_total;
 } rift_extrinsic_refine;
@@ -263,6 +267,30 @@ static bool use_ovr_fusion(void)
 		use = !(e && strcmp(e, "ukf") == 0);
 	}
 	return use;
+}
+
+/* Tell every tracked device that a sensor's extrinsics moved. Each fix taken
+ * through that sensor was computed against a world that has since shifted, so
+ * the fusion must stop treating its pending error as current. Oculus does the
+ * same and says so: "Ekf CameraPoseChange: dt ... dr ..." followed by
+ * "Ekf Reset on CameraPoseChange". */
+static void notify_camera_moved(rift_tracker_ctx *ctx, const vec3f *dpos, float dang)
+{
+	/* how wrong the pose could now be, as a variance */
+	const double pos_var = (double)ovec3f_get_length(dpos) * ovec3f_get_length(dpos);
+	const double rot_var = (double)dang * dang;
+	int i;
+
+	for (i = 0; i < ctx->n_devices; i++) {
+		rift_tracked_device_priv *dev = ctx->devices + i;
+
+		ohmd_lock_mutex(dev->device_lock);
+		if (use_ovr_fusion())
+			rift_fusion_ovr_notify_camera_moved(&dev->ovr_fusion);
+		else
+			rift_kalman_6dof_notify_camera_moved(&dev->ukf_fusion, pos_var, rot_var);
+		ohmd_unlock_mutex(dev->device_lock);
+	}
 }
 
 static void fusion_imu_update(rift_tracked_device_priv *dev, uint64_t time,
@@ -369,6 +397,13 @@ static bool extrinsic_refine_enabled(void)
 	}
 	return enabled;
 }
+
+/* Calibration settle state, mirroring the runtime's own
+ * "Camera Calibration Settled/Unsettled" and its is_sensor_settled /
+ * are_sensors_settled telemetry. A sensor is unsettled while refinement is
+ * still moving it, and settles once this many consecutive evaluations produce
+ * a step small enough to be inside the deadband. */
+#define EXTRINSIC_SETTLE_QUIET_ROUNDS 3
 
 #define EXTRINSIC_REFINE_MIN_MEAS 100
 #define EXTRINSIC_REFINE_INTERVAL_NS 5000000000ULL
@@ -2071,8 +2106,17 @@ void rift_tracker_extrinsic_refine_apply(rift_tracker_ctx *ctx, rift_sensor_ctx 
 	}
 	ohmd_unlock_mutex(ctx->refine_lock);
 
-	if (!have)
+	if (!have) {
+		/* Nothing worth correcting this round. Enough of those in a row and
+		 * the sensor's calibration is settled. */
+		ohmd_lock_mutex(ctx->refine_lock);
+		if (!r->settled && ++r->quiet_rounds >= EXTRINSIC_SETTLE_QUIET_ROUNDS) {
+			r->settled = true;
+			LOGI("sensor %s calibration SETTLED", rift_sensor_serial_no(sensor));
+		}
+		ohmd_unlock_mutex(ctx->refine_lock);
 		return;
+	}
 
 	float dist = ovec3f_get_length(&mean_pos);
 	float t_pos = EXTRINSIC_REFINE_GAIN;
@@ -2093,6 +2137,30 @@ void rift_tracker_extrinsic_refine_apply(rift_tracker_ctx *ctx, rift_sensor_ctx 
 	rift_sensor_get_pose(sensor, &cur);
 	oposef_apply(&cur, &step, &newp);
 	rift_sensor_set_pose(sensor, &newp);
+
+	/* Every fix taken through this sensor was computed against the pose we
+	 * just changed. Say so, in the same terms the runtime does, and make the
+	 * fusion stop trusting its pending error. */
+	{
+		vec3f applied_d;
+		float applied_ang = ang * t_ang;
+		ovec3f_subtract(&newp.pos, &cur.pos, &applied_d);
+
+		LOGI("sensor %s CameraPoseChange: dt %.1f %.1f %.1f (%.1f) mm  dr %.2f deg",
+			rift_sensor_serial_no(sensor),
+			applied_d.x * 1000.0, applied_d.y * 1000.0, applied_d.z * 1000.0,
+			ovec3f_get_length(&applied_d) * 1000.0, RAD_TO_DEG(applied_ang));
+
+		notify_camera_moved(ctx, &applied_d, applied_ang);
+
+		ohmd_lock_mutex(ctx->refine_lock);
+		r->quiet_rounds = 0;
+		if (r->settled) {
+			r->settled = false;
+			LOGI("sensor %s calibration UNSETTLED", rift_sensor_serial_no(sensor));
+		}
+		ohmd_unlock_mutex(ctx->refine_lock);
+	}
 
 	bool save = false;
 	ohmd_lock_mutex(ctx->refine_lock);
