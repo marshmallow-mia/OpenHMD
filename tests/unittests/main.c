@@ -54,6 +54,8 @@ int main()
 	Test(test_rift_kalman_stationary);
 	Test(test_rift_kalman_two_sample_rates);
 	Test(test_rift_kalman_delayed_position_update);
+	Test(test_rift_fusion_ovr_saturated_accel_ignored);
+	Test(test_rift_kalman_rejects_non_finite_imu);
 	printf("\n");
 
 	printf("opencv geometry tests\n");

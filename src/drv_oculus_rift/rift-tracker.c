@@ -132,6 +132,7 @@ struct rift_tracked_device_priv {
 	int n_led_pos;
 	/* Joint reconstruction telemetry */
 	uint32_t joint_solved, joint_rejected, joint_single;
+	uint32_t imu_saturated_samples;
 
 	ohmd_mutex *device_lock;
 
@@ -265,12 +266,12 @@ static bool use_ovr_fusion(void)
 }
 
 static void fusion_imu_update(rift_tracked_device_priv *dev, uint64_t time,
-	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag)
+	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag, bool accel_saturated)
 {
 	if (use_ovr_fusion())
-		rift_fusion_ovr_imu_update(&dev->ovr_fusion, time, ang_vel, accel, mag);
+		rift_fusion_ovr_imu_update(&dev->ovr_fusion, time, ang_vel, accel, mag, accel_saturated);
 	else
-		rift_kalman_6dof_imu_update(&dev->ukf_fusion, time, ang_vel, accel, mag);
+		rift_kalman_6dof_imu_update(&dev->ukf_fusion, time, ang_vel, accel, mag, accel_saturated);
 }
 
 static void fusion_pose_update(rift_tracked_device_priv *dev, uint64_t time,
@@ -984,7 +985,7 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 	free (tracker_ctx);
 }
 
-void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field)
+void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t local_ts, uint32_t device_ts, float dt, const vec3f* ang_vel, const vec3f* accel, const vec3f* mag_field, rift_imu_sample_flags flags)
 {
 	rift_tracked_device_priv *dev = (rift_tracked_device_priv *) (dev_base);
 	rift_tracked_device_imu_observation *obs;
@@ -1001,7 +1002,20 @@ void rift_tracked_device_imu_update(rift_tracked_device *dev_base, uint64_t loca
 	dev->last_device_ts = device_ts;
 	dev->last_imu_local_ts = local_ts;
 
-	fusion_imu_update(dev, dev->device_time_ns, ang_vel, accel, mag_field);
+	if (flags != RIFT_IMU_SAMPLE_OK) {
+		dev->imu_saturated_samples++;
+		if ((dev->imu_saturated_samples % 500) == 1) {
+			LOGI("Device %d: IMU saturation (%s%s), %u samples so far - the reading is "
+				"clipped, so it is being ignored rather than integrated",
+				dev->base.id,
+				(flags & RIFT_IMU_ACCEL_SATURATED) ? "accel" : "",
+				(flags & RIFT_IMU_GYRO_SATURATED) ? " gyro" : "",
+				dev->imu_saturated_samples);
+		}
+	}
+
+	fusion_imu_update(dev, dev->device_time_ns, ang_vel, accel, mag_field,
+		(flags & RIFT_IMU_ACCEL_SATURATED) != 0);
 
 	obs = dev->pending_imu_observations + dev->num_pending_imu_observations;
 	obs->local_ts = local_ts;

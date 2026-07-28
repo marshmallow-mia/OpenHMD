@@ -12,6 +12,7 @@
 
 #include "tests.h"
 #include "drv_oculus_rift/rift-kalman-6dof.h"
+#include "drv_oculus_rift/rift-fusion-ovr.h"
 
 #define GRAVITY 9.80665
 
@@ -38,7 +39,7 @@ static void run_stationary(double seconds, int hz, posef *out_pose,
 
 	for (uint64_t i = 1; i <= n; i++) {
 		t = i * step_ns;
-		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL);
+		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL, false);
 
 		if (obs_every > 0 && (i % obs_every) == 0) {
 			int slot = (int)((i / obs_every) % 3);
@@ -113,14 +114,14 @@ void test_rift_kalman_delayed_position_update()
 	uint64_t t = 0;
 	for (int i = 1; i <= 500; i++) {
 		t = (uint64_t)i * 1000000ULL;
-		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL);
+		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL, false);
 	}
 
 	/* snapshot a slot 20 ms in the past, then feed the observation late */
 	rift_kalman_6dof_prepare_delay_slot(&f, t, 0);
 	for (int i = 501; i <= 520; i++) {
 		t = (uint64_t)i * 1000000ULL;
-		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL);
+		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL, false);
 	}
 	rift_kalman_6dof_position_update(&f, t, &truth.pos, 0, 1.0f);
 	rift_kalman_6dof_release_delay_slot(&f, 0);
@@ -131,6 +132,88 @@ void test_rift_kalman_delayed_position_update()
 	TAssert(isfinite(pose.pos.x) && isfinite(pose.pos.y) && isfinite(pose.pos.z));
 	TAssert(vec3f_eq(pose.pos, truth.pos, 0.02f));
 	TAssert(ovec3f_get_length(&vel) < 0.2f);
+
+	rift_kalman_6dof_clear(&f);
+}
+
+/* A saturated accelerometer reading points the wrong way, so it must not be
+ * allowed to pull the tilt. The A/B matters: the same bogus reading fed as
+ * UNSATURATED has to move the orientation, or this test proves nothing. */
+void test_rift_fusion_ovr_saturated_accel_ignored()
+{
+	/* a reading that claims "down" is sideways - what a clipped axis looks like */
+	const vec3f bogus = {{ (float)GRAVITY, 0.0f, 0.0f }};
+	const vec3f gyro = {{ 0.0f, 0.0f, 0.0f }};
+	posef init;
+	float tilt[2];
+
+	ovec3f_set(&init.pos, 0.0f, 1.0f, -1.0f);
+	oquatf_set(&init.orient, 0.0f, 0.0f, 0.0f, 1.0f);
+
+	for (int saturated = 0; saturated < 2; saturated++) {
+		rift_fusion_ovr f;
+		rift_fusion_ovr_init(&f, &init, 3);
+
+		for (int i = 1; i <= 4000; i++)
+			rift_fusion_ovr_imu_update(&f, (uint64_t)i * 1000000ULL, &gyro, &bogus,
+				NULL, saturated != 0);
+
+		posef out;
+		vec3f vel, accel, ang_vel;
+		rift_fusion_ovr_get_pose_at(&f, 4000000000ULL, &out, &vel, &accel, &ang_vel,
+			NULL, NULL);
+
+		/* how far the world-up axis has been dragged from vertical */
+		const vec3f up = {{ 0.0f, 1.0f, 0.0f }};
+		vec3f rotated;
+		oquatf_get_rotated(&out.orient, &up, &rotated);
+		tilt[saturated] = ovec3f_get_angle(&rotated, &up);
+
+		rift_fusion_ovr_clear(&f);
+	}
+
+	/* unsaturated: the bogus reading is believed and drags the tilt right over */
+	TAssert(tilt[0] > 1.0f);
+	/* saturated: it is ignored, and the orientation stays put */
+	TAssert(tilt[1] < 0.01f);
+}
+
+/* A non-finite IMU sample must not escape into the reported pose. */
+void test_rift_kalman_rejects_non_finite_imu()
+{
+	rift_kalman_6dof_filter f;
+	posef truth, pose;
+	const vec3f good_accel = {{ 0.0f, (float)GRAVITY, 0.0f }};
+	const vec3f gyro = {{ 0.0f, 0.0f, 0.0f }};
+	const vec3f nan_accel = {{ 0.0f, (float)NAN, 0.0f }};
+
+	ovec3f_set(&truth.pos, 0.0f, 1.0f, -1.0f);
+	oquatf_set(&truth.orient, 0.0f, 0.0f, 0.0f, 1.0f);
+	rift_kalman_6dof_init(&f, &truth, 3);
+
+	uint64_t t = 0;
+	for (int i = 1; i <= 200; i++) {
+		t = (uint64_t)i * 1000000ULL;
+		rift_kalman_6dof_imu_update(&f, t, &gyro, &good_accel, NULL, false);
+	}
+
+	for (int i = 201; i <= 210; i++) {
+		t = (uint64_t)i * 1000000ULL;
+		rift_kalman_6dof_imu_update(&f, t, &gyro, &nan_accel, NULL, false);
+	}
+
+	for (int i = 211; i <= 400; i++) {
+		t = (uint64_t)i * 1000000ULL;
+		rift_kalman_6dof_imu_update(&f, t, &gyro, &good_accel, NULL, false);
+	}
+
+	vec3f vel, accel_out, ang_vel, pos_err;
+	rift_kalman_6dof_get_pose_at(&f, t, &pose, &vel, &accel_out, &ang_vel, &pos_err, NULL);
+
+	TAssert(isfinite(pose.pos.x) && isfinite(pose.pos.y) && isfinite(pose.pos.z));
+	TAssert(isfinite(pose.orient.x) && isfinite(pose.orient.y) &&
+	        isfinite(pose.orient.z) && isfinite(pose.orient.w));
+	TAssert(isfinite(vel.x) && isfinite(vel.y) && isfinite(vel.z));
 
 	rift_kalman_6dof_clear(&f);
 }

@@ -172,8 +172,22 @@ void rift_fusion_ovr_release_delay_slot(rift_fusion_ovr *f, int delay_slot)
  * world-frame mean/variance for the confidence gate:
  * confidence = clamp(0.48 - 0.1 ln(stddev), 0, 1) * fill_ratio */
 static float gravity_filter_update(rift_fusion_ovr *f, const vec3f *accel,
-	float dt, const quatf *delta_q)
+	float dt, const quatf *delta_q, bool saturated)
 {
+	if (saturated) {
+		/* Keep the stored estimate in the current body frame, but do not let a
+		 * clipped reading into it - it would poison the low-pass for as long
+		 * as the filter's time constant. */
+		if (f->grav_init) {
+			quatf dq_inv = *delta_q;
+			vec3f rotated;
+			oquatf_inverse(&dq_inv);
+			oquatf_get_rotated(&dq_inv, &f->grav_filter, &rotated);
+			f->grav_filter = rotated;
+		}
+		return 0.0f;
+	}
+
 	if (!f->grav_init) {
 		f->grav_filter = *accel;
 		f->grav_init = true;
@@ -328,7 +342,7 @@ static void apply_position_correction(rift_fusion_ovr *f, float dt)
 }
 
 void rift_fusion_ovr_imu_update(rift_fusion_ovr *f, uint64_t time,
-	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag)
+	const vec3f *ang_vel, const vec3f *accel, const vec3f *mag, bool accel_saturated)
 {
 	(void)mag; /* vision replaces the magnetometer (SDK: MagCalibrated false) */
 
@@ -380,9 +394,16 @@ void rift_fusion_ovr_imu_update(rift_fusion_ovr *f, uint64_t time,
 		ovec3f_set(&f->lin_vel, 0, 0, 0);
 	}
 
-	float confidence = gravity_filter_update(f, accel, dt, &delta_q);
+	float confidence = gravity_filter_update(f, accel, dt, &delta_q, accel_saturated);
 
-	apply_tilt_correction(f, dt, confidence);
+	/* A clipped accelerometer reading points the wrong way, so it cannot say
+	 * which way is down. Keep integrating - the gyro is still good - but skip
+	 * the tilt correction entirely. Note it is not enough to drop the
+	 * confidence to zero: apply_tilt_correction's start-up branch snaps to the
+	 * accelerometer regardless of confidence, so a clipped first sample would
+	 * otherwise throw the orientation straight over. */
+	if (!accel_saturated)
+		apply_tilt_correction(f, dt, confidence);
 	if (vision_recent) {
 		apply_vision_yaw_correction(f, dt);
 		apply_position_correction(f, dt);
