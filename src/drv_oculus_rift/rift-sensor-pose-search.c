@@ -638,9 +638,23 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	 * world coordinates. A sensor with no pose still solves the device
 	 * perfectly well in its own frame, and that is exactly the measurement
 	 * needed to work out where it sits relative to a sensor that is placed. */
+	/* The gate here MUST NOT include RIFT_POSE_MATCH_STRONG. That flag is
+	 * only granted to a pose that agrees with the prior, and the prior comes
+	 * from the extrinsics being calibrated -- so a sensor whose stored pose
+	 * is wrong is denied STRONG *because* it is wrong, and would never be
+	 * allowed to supply the observations that would fix it. Measured on
+	 * hardware: with the config 214 mm stale, sensor 1 reported flags 0x321
+	 * on every single one of its 934 observations -- LED IDs verified,
+	 * orientation matching, position rejected -- and the calibration never
+	 * ran.
+	 *
+	 * LED-ID verification and reprojection error are properties of this
+	 * camera's own image and cannot be poisoned by a bad camera pose, so
+	 * they are what the gate is built from. */
 	if (pf->calib_cb != NULL &&
-	    POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG | RIFT_POSE_MATCH_LED_IDS) &&
-	    score->matched_blobs >= 10)
+	    POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS) &&
+	    score->matched_blobs >= 10 &&
+	    score->reprojection_error / score->matched_blobs < 1.5)
 		pf->calib_cb(pf->pose_cb_data, dev, frame, &pose);
 
 	if (!pf->have_camera_pose) {

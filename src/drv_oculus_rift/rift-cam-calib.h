@@ -59,6 +59,14 @@
  * without this the estimate defends its own stale mean forever. ~1.2 s at the
  * 52 Hz exposure rate. */
 #define RIFT_CAM_CALIB_BUMP_RUN 60
+/* Settling at MIN_SAMPLES gets tracking working within a second, but the mean
+ * of 30 samples still carries the per-exposure scatter divided by sqrt(30) --
+ * measured live, that left 4.05 mm of cross-camera disagreement against the
+ * 1.67 mm the same data supports once averaged properly. So the estimate is
+ * adopted a second time once it is genuinely well averaged, and then left
+ * alone: the remaining drift is the online refiner's job, and each adoption
+ * disturbs the fusion. ~12 s at the 52 Hz exposure rate. */
+#define RIFT_CAM_CALIB_REFINED_SAMPLES 600
 
 typedef enum {
 	/* nothing known — the sensor cannot contribute to tracking */
