@@ -198,13 +198,15 @@ static bool build_joint_view(rift_pose_finder *pf, rift_sensor_analysis_frame *f
 }
 
 void rift_pose_finder_init(rift_pose_finder *pf, rift_sensor_camera_params *calib,
-		rift_pose_finder_cb pose_cb, void *pose_cb_data)
+		rift_pose_finder_cb pose_cb, rift_pose_finder_calib_cb calib_cb,
+		void *pose_cb_data)
 {
 	pf->have_camera_pose = false;
 	pf->calib = calib;
 	pf->cs = correspondence_search_new(calib);
 
 	pf->pose_cb = pose_cb;
+	pf->calib_cb = calib_cb;
 	pf->pose_cb_data = pose_cb_data;
 }
 
@@ -630,6 +632,16 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 
 	if (POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS))
 		rift_cal_capture_obs(pf, frame, dev, dev_state, exp_dev_info, &pose);
+
+	/* Hand the object->camera pose to automatic extrinsic calibration BEFORE
+	 * the have_camera_pose gate below, and before `pose` is composed into
+	 * world coordinates. A sensor with no pose still solves the device
+	 * perfectly well in its own frame, and that is exactly the measurement
+	 * needed to work out where it sits relative to a sensor that is placed. */
+	if (pf->calib_cb != NULL &&
+	    POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG | RIFT_POSE_MATCH_LED_IDS) &&
+	    score->matched_blobs >= 10)
+		pf->calib_cb(pf->pose_cb_data, dev, frame, &pose);
 
 	if (!pf->have_camera_pose) {
 		LOGD("Sensor %d No camera pose yet - gravity error is %f degrees rot_error (%f, %f, %f). Not fusing pose for device %d",

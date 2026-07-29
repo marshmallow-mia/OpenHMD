@@ -140,6 +140,17 @@ void test_rift_cam_calib_averages_and_settles()
 	TAssert(c.state == RIFT_CAM_CALIBRATED);
 	TAssert(c.settled);
 
+	/* the reported dispersion is bias-corrected, so it reflects the real
+	 * per-sample scatter rather than an EMA still climbing out of zero */
+	{
+		float dev_ang, dev_pos;
+		rift_cam_calib_dev(&c, &dev_ang, &dev_pos);
+		TAssert(dev_pos > 0.0005f);   /* the noise is not invisible... */
+		TAssert(dev_pos < 0.010f);    /* ...and it is inside the settle bar */
+		TAssert(dev_ang > 0.0f);
+		TAssert(dev_ang < 0.0087f);
+	}
+
 	/* the averaged estimate beats the single-shot one it started from */
 	TAssert(pose_pos_err(&got, &truth) < pose_pos_err(&first, &truth));
 	TAssert(pose_pos_err(&got, &truth) < 0.005f);

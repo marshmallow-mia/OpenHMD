@@ -365,6 +365,9 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
 	posef *obj_world_pose, rift_pose_metrics *score,
 	const rift_joint_view *view);
+static void handle_calib_obs (rift_sensor_ctx *sensor_ctx,
+	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
+	const posef *obj_cam_pose);
 
 rift_sensor_ctx *
 rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
@@ -413,7 +416,9 @@ rift_sensor_new(ohmd_context* ohmd_ctx, int id, const char *serial_no,
 
 	sensor_ctx->bw = blobwatch_new(calib->is_cv1 ? BLOB_THRESHOLD_CV1 : BLOB_THRESHOLD_DK2);
 
-	rift_pose_finder_init(&sensor_ctx->pf, calib, (rift_pose_finder_cb) handle_found_pose, sensor_ctx);
+	rift_pose_finder_init(&sensor_ctx->pf, calib,
+		(rift_pose_finder_cb) handle_found_pose,
+		(rift_pose_finder_calib_cb) handle_calib_obs, sensor_ctx);
 	rift_cal_capture_register_sensor(id, serial_no, calib);
 
 	/* Raw debug video stream */
@@ -697,6 +702,17 @@ static bool handle_found_pose (rift_sensor_ctx *sensor_ctx,
 	return ret;
 }
 
+/* Automatic extrinsic calibration: this sensor's view of the device in its
+ * OWN frame, delivered whether or not the sensor is calibrated. */
+static void handle_calib_obs (rift_sensor_ctx *sensor_ctx,
+	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
+	const posef *obj_cam_pose)
+{
+	rift_tracker_add_calib_obs(sensor_ctx->tracker, sensor_ctx, dev,
+		frame->exposure_info_valid ? &frame->exposure_info : NULL, obj_cam_pose);
+	rift_tracker_cam_calib_apply(sensor_ctx->tracker, sensor_ctx);
+}
+
 const char *rift_sensor_serial_no (rift_sensor_ctx *sensor)
 {
 	return sensor->serial_no;
@@ -729,4 +745,13 @@ void rift_sensor_get_pose(rift_sensor_ctx *sensor, posef *camera_pose)
 	ohmd_lock_mutex (sensor->sensor_lock);
 	*camera_pose = sensor->pf.camera_pose;
 	ohmd_unlock_mutex (sensor->sensor_lock);
+}
+
+bool rift_sensor_have_pose(rift_sensor_ctx *sensor)
+{
+	bool have;
+	ohmd_lock_mutex (sensor->sensor_lock);
+	have = sensor->pf.have_camera_pose;
+	ohmd_unlock_mutex (sensor->sensor_lock);
+	return have;
 }

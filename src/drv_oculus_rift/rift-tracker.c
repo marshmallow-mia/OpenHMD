@@ -24,6 +24,7 @@
 #include "rift-tracker.h"
 #include "rift-tracker-config.h"
 #include "rift-sync-monitor.h"
+#include "rift-cam-calib.h"
 #include "rift-sensor.h"
 #include "rift-sensor-usb.h"
 
@@ -233,6 +234,18 @@ typedef struct rift_extrinsic_refine {
 	double applied_ang_total;
 } rift_extrinsic_refine;
 
+/* One exposure's worth of per-sensor object->camera poses, waiting to be
+ * paired. Sensors deliver ms apart in racing order, so a couple of exposures
+ * are kept in flight; the exposure counter is the key both sensors agree on. */
+#define RIFT_CALIB_EXP_SLOTS 4
+
+typedef struct {
+	bool valid;
+	uint16_t count;              /* exposure counter */
+	bool have[RIFT_MAX_SENSORS];
+	posef obj_cam[RIFT_MAX_SENSORS];
+} rift_calib_exposure;
+
 struct rift_tracker_ctx_s
 {
 	ohmd_context* ohmd_ctx;
@@ -244,6 +257,16 @@ struct rift_tracker_ctx_s
 
 	ohmd_mutex *refine_lock;
 	rift_extrinsic_refine refine[RIFT_MAX_SENSORS];
+
+	/* Automatic extrinsic calibration (rift-cam-calib.h): every sensor's
+	 * pose of the HMD in its own frame, paired per exposure against the
+	 * anchor sensor's. */
+	ohmd_mutex *calib_lock;
+	rift_calib_exposure calib_exp[RIFT_CALIB_EXP_SLOTS];
+	int calib_exp_next;
+	rift_cam_calib cam_calib[RIFT_MAX_SENSORS];
+	bool cam_calib_adopted[RIFT_MAX_SENSORS];
+	uint32_t cam_calib_pairs;
 
 	ohmd_thread* usb_thread;
 	int usb_completed;
@@ -663,6 +686,9 @@ rift_tracker_new (ohmd_context* ohmd_ctx,
 	tracker_ctx->ohmd_ctx = ohmd_ctx;
 	tracker_ctx->tracker_lock = ohmd_create_mutex(ohmd_ctx);
 	tracker_ctx->refine_lock = ohmd_create_mutex(ohmd_ctx);
+	tracker_ctx->calib_lock = ohmd_create_mutex(ohmd_ctx);
+	for (i = 0; i < RIFT_MAX_SENSORS; i++)
+		rift_cam_calib_init(tracker_ctx->cam_calib + i);
 
 	rift_tracker_config_init(&tracker_ctx->config);
 	rift_tracker_config_load(ohmd_ctx, &tracker_ctx->config);
@@ -1056,6 +1082,7 @@ rift_tracker_free (rift_tracker_ctx *tracker_ctx)
 
 	ohmd_destroy_mutex (tracker_ctx->tracker_lock);
 	ohmd_destroy_mutex (tracker_ctx->refine_lock);
+	ohmd_destroy_mutex (tracker_ctx->calib_lock);
 	free (tracker_ctx);
 }
 
@@ -2105,6 +2132,175 @@ void rift_tracker_update_sensor_pose(rift_tracker_ctx *tracker_ctx, rift_sensor_
 	rift_tracker_config_set_sensor_pose(&tracker_ctx->config, serial_no, new_pose);
 	rift_tracker_config_save(tracker_ctx->ohmd_ctx, &tracker_ctx->config);
 	ohmd_unlock_mutex (tracker_ctx->tracker_lock);
+}
+
+/* Set OHMD_RIFT_NO_AUTO_CALIB=1 to disable automatic extrinsic calibration and
+ * rely purely on the stored room config (for A/B testing). */
+static bool auto_calib_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_AUTO_CALIB");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+static int sensor_index(rift_tracker_ctx *ctx, const char *serial)
+{
+	int i;
+	for (i = 0; i < ctx->n_sensors; i++) {
+		if (strcmp(rift_sensor_serial_no(ctx->sensors[i]), serial) == 0)
+			return i;
+	}
+	return -1;
+}
+
+/* Called from a sensor's analysis thread with the device pose solved in that
+ * sensor's OWN frame, whether or not the sensor knows where it is. Pairs it
+ * with the anchor sensor's solution for the same exposure; the two together
+ * determine the transform between the cameras outright, with no movement and
+ * no user step ("Single frame calibration, camera %d" in the Oculus runtime).
+ */
+void rift_tracker_add_calib_obs(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor,
+	rift_tracked_device *dev, rift_tracker_exposure_info *exposure_info,
+	const posef *obj_cam_pose)
+{
+	rift_calib_exposure *e = NULL;
+	int idx, i;
+
+	if (!auto_calib_enabled() || ctx->n_sensors < 2 || exposure_info == NULL)
+		return;
+	/* Only the HMD: its constellation is dense enough that a single-frame
+	 * solve is trustworthy, which a Touch ring's is not. */
+	if (dev->id != 0)
+		return;
+
+	idx = sensor_index(ctx, rift_sensor_serial_no(sensor));
+	if (idx < 0)
+		return;
+
+	ohmd_lock_mutex(ctx->calib_lock);
+
+	for (i = 0; i < RIFT_CALIB_EXP_SLOTS; i++) {
+		if (ctx->calib_exp[i].valid && ctx->calib_exp[i].count == exposure_info->count) {
+			e = ctx->calib_exp + i;
+			break;
+		}
+	}
+	if (e == NULL) {
+		e = ctx->calib_exp + ctx->calib_exp_next;
+		ctx->calib_exp_next = (ctx->calib_exp_next + 1) % RIFT_CALIB_EXP_SLOTS;
+		memset(e, 0, sizeof(*e));
+		e->valid = true;
+		e->count = exposure_info->count;
+	}
+
+	e->obj_cam[idx] = *obj_cam_pose;
+	e->have[idx] = true;
+
+	/* Everything is measured relative to sensor 0, the same anchor the
+	 * online refinement uses. */
+	if (idx != 0 && e->have[0]) {
+		if (rift_cam_calib_add(ctx->cam_calib + idx, e->obj_cam + 0, e->obj_cam + idx))
+			ctx->cam_calib_pairs++;
+	} else if (idx == 0) {
+		for (i = 1; i < ctx->n_sensors; i++) {
+			if (e->have[i]) {
+				if (rift_cam_calib_add(ctx->cam_calib + i, e->obj_cam + 0, e->obj_cam + i))
+					ctx->cam_calib_pairs++;
+			}
+		}
+	}
+
+	ohmd_unlock_mutex(ctx->calib_lock);
+}
+
+/* Called from a sensor's own analysis thread (no locks held). Once this
+ * sensor's relative pose to the anchor has converged, place it. This runs
+ * even for a sensor that has no pose at all, which is the case the old
+ * gravity bootstrap could not cover: it needs the HMD's fused pose, and a
+ * sensor that has never contributed a fix does not get one. */
+void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor)
+{
+	posef rel, anchor_world, newp, cur;
+	rift_cam_calib snapshot;
+	int idx;
+	bool adopted;
+
+	if (!auto_calib_enabled() || ctx->n_sensors < 2)
+		return;
+
+	idx = sensor_index(ctx, rift_sensor_serial_no(sensor));
+	if (idx <= 0)
+		return; /* the anchor defines the frame; it has nothing to adopt */
+
+	ohmd_lock_mutex(ctx->calib_lock);
+	snapshot = ctx->cam_calib[idx];
+	adopted = ctx->cam_calib_adopted[idx];
+	ohmd_unlock_mutex(ctx->calib_lock);
+
+	if (snapshot.state != RIFT_CAM_CALIBRATED || !snapshot.settled)
+		return;
+	if (adopted)
+		return;
+	if (!rift_cam_calib_get(&snapshot, &rel))
+		return;
+
+	/* The anchor has to know where IT is before anything can be placed
+	 * against it. It gets that from the existing gravity bootstrap in
+	 * rift-sensor-pose-search.c, or from the stored config. */
+	if (!rift_sensor_have_pose(ctx->sensors[0]))
+		return;
+	rift_sensor_get_pose(ctx->sensors[0], &anchor_world);
+
+	rift_cam_calib_to_world(&anchor_world, &rel, &newp);
+
+	bool had_pose = rift_sensor_have_pose(sensor);
+	vec3f d = {{ 0, 0, 0 }};
+	float dang = 0.0f;
+
+	if (had_pose) {
+		rift_sensor_get_pose(sensor, &cur);
+		ovec3f_subtract(&newp.pos, &cur.pos, &d);
+		quatf inv = cur.orient, dq;
+		oquatf_inverse(&inv);
+		oquatf_mult(&newp.orient, &inv, &dq);
+		dang = 2.0f * acosf(OHMD_MIN(1.0f, fabsf(dq.w)));
+	}
+
+	float dev_ang, dev_pos;
+	rift_cam_calib_dev(&snapshot, &dev_ang, &dev_pos);
+	LOGI("sensor %s: automatic calibration adopted after %u exposures "
+		"(%u rejected, scatter %.3f deg / %.1f mm)%s",
+		rift_sensor_serial_no(sensor), snapshot.n, snapshot.n_rejected,
+		RAD_TO_DEG(dev_ang), dev_pos * 1000.0f,
+		had_pose ? "" : " - sensor had no pose at all");
+	if (had_pose) {
+		LOGI("sensor %s: moved %.1f mm / %.2f deg from the pose it was using",
+			rift_sensor_serial_no(sensor), ovec3f_get_length(&d) * 1000.0f,
+			RAD_TO_DEG(dang));
+	}
+
+	rift_sensor_set_pose(sensor, &newp);
+	rift_tracker_update_sensor_pose(ctx, sensor, &newp);
+	notify_camera_moved(ctx, &d, dang);
+
+	/* The online refiner's window measures mismatch against the pose that
+	 * was just replaced, so every measurement in it is now about a world
+	 * that no longer exists - applying it would drag the sensor back.
+	 * Restart the window, and re-anchor the net-drift reference so the
+	 * deliberate jump isn't reported as creep. */
+	ohmd_lock_mutex(ctx->refine_lock);
+	ctx->refine[idx].n_meas = 0;
+	ctx->refine[idx].have_start = false;
+	ctx->refine[idx].quiet_rounds = 0;
+	ctx->refine[idx].settled = false;
+	ohmd_unlock_mutex(ctx->refine_lock);
+
+	ohmd_lock_mutex(ctx->calib_lock);
+	ctx->cam_calib_adopted[idx] = true;
+	ohmd_unlock_mutex(ctx->calib_lock);
 }
 
 /* Called from a sensor's own analysis thread (no locks held) after each

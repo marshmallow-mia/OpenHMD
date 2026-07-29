@@ -26,6 +26,15 @@ typedef bool (*rift_pose_finder_cb) (void *cb_data,
 	posef *obj_world_pose, rift_pose_metrics *score,
 	const rift_joint_view *view);
 
+/* A device pose solved in THIS sensor's OWN frame (object->camera), handed
+ * over regardless of whether the sensor has a world pose yet. That is the
+ * whole point of it: pairing two sensors' object->camera poses for the same
+ * exposure locates them relative to each other, so a sensor with no
+ * calibration at all can still be placed (rift-cam-calib.h). */
+typedef void (*rift_pose_finder_calib_cb) (void *cb_data,
+	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
+	const posef *obj_cam_pose);
+
 struct rift_pose_finder {
 	int sensor_id;
 	rift_sensor_camera_params *calib;
@@ -40,11 +49,13 @@ struct rift_pose_finder {
 	correspondence_search_t *cs;
 
 	rift_pose_finder_cb pose_cb;
+	rift_pose_finder_calib_cb calib_cb;
 	void *pose_cb_data;
 };
 
 void rift_pose_finder_init(rift_pose_finder *pf, rift_sensor_camera_params *calib,
-		rift_pose_finder_cb pose_cb, void *pose_cb_data);
+		rift_pose_finder_cb pose_cb, rift_pose_finder_calib_cb calib_cb,
+		void *pose_cb_data);
 void rift_pose_finder_clear(rift_pose_finder *pf);
 
 void rift_pose_finder_process_blobs_fast(rift_pose_finder *pf, rift_sensor_analysis_frame *frame,

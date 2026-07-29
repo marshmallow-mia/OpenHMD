@@ -82,5 +82,6 @@ bool rift_sensor_start(rift_sensor_ctx *sensor);
 
 void rift_sensor_set_pose(rift_sensor_ctx *sensor, posef *camera_pose);
 void rift_sensor_get_pose(rift_sensor_ctx *sensor, posef *camera_pose);
+bool rift_sensor_have_pose(rift_sensor_ctx *sensor);
 
 #endif
