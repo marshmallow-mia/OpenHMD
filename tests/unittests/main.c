@@ -59,6 +59,13 @@ int main()
 	Test(test_rift_fusion_ovr_camera_moved);
 	printf("\n");
 
+	printf("camera calibration tests\n");
+	Test(test_rift_cam_calib_single_exposure_is_enough);
+	Test(test_rift_cam_calib_averages_and_settles);
+	Test(test_rift_cam_calib_rejects_stale_stored_calibration);
+	Test(test_rift_cam_calib_rejects_outliers);
+	printf("\n");
+
 	printf("sync monitor tests\n");
 	Test(test_rift_sync_monitor_clean_stream);
 	Test(test_rift_sync_monitor_repeated_exposure);

@@ -63,6 +63,12 @@ void test_rift_fusion_ovr_saturated_accel_ignored();
 void test_rift_kalman_rejects_non_finite_imu();
 void test_rift_fusion_ovr_camera_moved();
 
+// automatic camera extrinsic calibration
+void test_rift_cam_calib_single_exposure_is_enough();
+void test_rift_cam_calib_averages_and_settles();
+void test_rift_cam_calib_rejects_stale_stored_calibration();
+void test_rift_cam_calib_rejects_outliers();
+
 // exposure/frame/pose timing monitor
 void test_rift_sync_monitor_clean_stream();
 void test_rift_sync_monitor_repeated_exposure();
