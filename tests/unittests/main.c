@@ -52,6 +52,7 @@ int main()
 
 	printf("kalman 6dof tests\n");
 	Test(test_rift_kalman_stationary);
+	Test(test_rift_kalman_five_delay_slots);
 	Test(test_rift_kalman_two_sample_rates);
 	Test(test_rift_kalman_delayed_position_update);
 	Test(test_rift_fusion_ovr_saturated_accel_ignored);
