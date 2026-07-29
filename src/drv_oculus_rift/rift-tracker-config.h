@@ -18,6 +18,14 @@ typedef struct rift_tracker_sensor_config_s rift_tracker_sensor_config;
 struct rift_tracker_sensor_config_s {
 	char serial_no[RIFT_SENSOR_SERIAL_LEN+1];
 	posef pose;
+	/* How many distinct viewpoints the calibration that produced this pose
+	 * was fitted over. A fit from one headset position is superb at that
+	 * position and poor elsewhere, so without this a fresh session with the
+	 * headset sitting still would happily replace a well-conditioned
+	 * calibration with an overfit one - it beats the incumbent on its own
+	 * narrow history every time. 0 for configs written before this existed,
+	 * or by the offline solver. */
+	int viewpoints;
 };
 
 struct rift_tracker_config_s {
@@ -39,5 +47,9 @@ void rift_tracker_config_get_room_pose_offset(rift_tracker_config *config, posef
 
 void rift_tracker_config_set_sensor_pose(rift_tracker_config *config, const char *serial_no, posef *pose);
 bool rift_tracker_config_get_sensor_pose(rift_tracker_config *config, const char *serial_no, posef *pose);
+
+/* Viewpoint coverage of the stored calibration; 0 if unknown. */
+void rift_tracker_config_set_sensor_viewpoints(rift_tracker_config *config, const char *serial_no, int viewpoints);
+int rift_tracker_config_get_sensor_viewpoints(rift_tracker_config *config, const char *serial_no);
 
 #endif
