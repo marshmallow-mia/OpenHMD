@@ -41,4 +41,3 @@ void rift_tracker_config_set_sensor_pose(rift_tracker_config *config, const char
 bool rift_tracker_config_get_sensor_pose(rift_tracker_config *config, const char *serial_no, posef *pose);
 
 #endif
-
