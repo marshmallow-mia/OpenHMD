@@ -58,6 +58,15 @@ bool rift_tracked_device_get_gravity_model(rift_tracked_device *dev_base, vec3f 
 bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64_t local_ts, uint64_t frame_start_local_ts, rift_tracker_exposure_info *exposure_info, rift_pose_metrics *score, posef *pose, const rift_joint_view *view, const char *source);
 void rift_tracked_device_frame_release (rift_tracked_device *dev_base, rift_tracker_exposure_info *info);
 
+/* Automatic camera extrinsic calibration (rift-cam-calib.h). add_calib_obs
+ * takes the device's pose in ONE sensor's own frame; apply places a sensor
+ * once its relative pose to the anchor has converged. Both are called from
+ * the sensor's own analysis thread. */
+void rift_tracker_add_calib_obs(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor,
+	rift_tracked_device *dev, rift_tracker_exposure_info *exposure_info,
+	const posef *obj_cam_pose);
+void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor);
+
 void rift_tracker_update_sensor_pose(rift_tracker_ctx *tracker_ctx, rift_sensor_ctx *sensor, posef *new_pose);
 void rift_tracker_extrinsic_refine_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor);
 

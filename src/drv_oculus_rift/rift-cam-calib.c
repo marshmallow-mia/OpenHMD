@@ -14,10 +14,32 @@
  * outlier test for data this clean (the offline reference keeps 1004/1024). */
 #define DEV_BLEND 0.02f
 
+/* The deviation EMAs start at zero, so for the first few dozen samples they
+ * read low - which would make the sigma gate far tighter than 3 sigma and let
+ * the settle test fire before the dispersion is even known. Divide out the
+ * remaining bias, (1 - blend)^n, as an exponential average normally is. */
+void rift_cam_calib_dev(const rift_cam_calib *c, float *out_ang, float *out_pos)
+{
+	float scale = 1.0f - c->dev_warm;
+
+	if (scale < 1e-6f) {
+		if (out_ang != NULL)
+			*out_ang = 0.0f;
+		if (out_pos != NULL)
+			*out_pos = 0.0f;
+		return;
+	}
+	if (out_ang != NULL)
+		*out_ang = c->dev_ang / scale;
+	if (out_pos != NULL)
+		*out_pos = c->dev_pos / scale;
+}
+
 void rift_cam_calib_init(rift_cam_calib *c)
 {
 	memset(c, 0, sizeof(*c));
 	oquatf_set(&c->mean_orient, 0.0f, 0.0f, 0.0f, 1.0f);
+	c->dev_warm = 1.0f;
 	c->state = RIFT_CAM_UNCALIBRATED;
 }
 
@@ -72,7 +94,7 @@ bool rift_cam_calib_add(rift_cam_calib *c, const posef *obj_cam_ref,
 	const posef *obj_cam_other)
 {
 	posef rel;
-	float d_ang, d_pos;
+	float d_ang, d_pos, dev_ang, dev_pos;
 	vec3f dp;
 
 	single_frame_relative(obj_cam_ref, obj_cam_other, &rel);
@@ -98,9 +120,10 @@ bool rift_cam_calib_add(rift_cam_calib *c, const posef *obj_cam_ref,
 	 * something. A bumped sensor produces a sustained run of "outliers", so
 	 * the caller watches n_rejected and resets rather than relying on this
 	 * to track a real move. */
-	if (c->n >= RIFT_CAM_CALIB_MIN_SAMPLES && c->dev_ang > 0.0f && c->dev_pos > 0.0f) {
-		if (d_ang > RIFT_CAM_CALIB_OUTLIER_SIGMA * c->dev_ang ||
-		    d_pos > RIFT_CAM_CALIB_OUTLIER_SIGMA * c->dev_pos) {
+	rift_cam_calib_dev(c, &dev_ang, &dev_pos);
+	if (c->n >= RIFT_CAM_CALIB_MIN_SAMPLES && dev_ang > 0.0f && dev_pos > 0.0f) {
+		if (d_ang > RIFT_CAM_CALIB_OUTLIER_SIGMA * dev_ang ||
+		    d_pos > RIFT_CAM_CALIB_OUTLIER_SIGMA * dev_pos) {
 			c->n_rejected++;
 			return false;
 		}
@@ -125,10 +148,12 @@ bool rift_cam_calib_add(rift_cam_calib *c, const posef *obj_cam_ref,
 
 	c->dev_ang += (d_ang - c->dev_ang) * DEV_BLEND;
 	c->dev_pos += (d_pos - c->dev_pos) * DEV_BLEND;
+	c->dev_warm *= (1.0f - DEV_BLEND);
+	rift_cam_calib_dev(c, &dev_ang, &dev_pos);
 
 	if (c->n >= RIFT_CAM_CALIB_MIN_SAMPLES &&
-	    c->dev_ang <= RIFT_CAM_CALIB_SETTLE_ANG &&
-	    c->dev_pos <= RIFT_CAM_CALIB_SETTLE_POS) {
+	    dev_ang <= RIFT_CAM_CALIB_SETTLE_ANG &&
+	    dev_pos <= RIFT_CAM_CALIB_SETTLE_POS) {
 		c->state = RIFT_CAM_CALIBRATED;
 		c->settled = true;
 	} else if (c->state == RIFT_CAM_UNCALIBRATED) {

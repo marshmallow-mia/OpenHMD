@@ -74,12 +74,18 @@ typedef struct {
 	uint32_t n_rejected;     /* outliers dropped */
 
 	/* dispersion about the mean, as running means of the per-sample
-	 * deviation — cheap, and enough for a settle test and a sigma gate */
+	 * deviation — cheap, and enough for a settle test and a sigma gate.
+	 * Read them through rift_cam_calib_dev(), never raw: they start at zero
+	 * and need bias correction while the average is still warming up. */
 	float dev_ang;           /* radians */
 	float dev_pos;           /* metres */
+	float dev_warm;          /* (1 - blend)^n, the EMA's remaining bias */
 } rift_cam_calib;
 
 void rift_cam_calib_init(rift_cam_calib *c);
+
+/* Bias-corrected dispersion about the mean. Either output may be NULL. */
+void rift_cam_calib_dev(const rift_cam_calib *c, float *out_ang, float *out_pos);
 
 /* Seed from an existing (e.g. stored) relative pose. The result is ESTIMATED,
  * never CALIBRATED: a calibration off disk has to earn trust against live
