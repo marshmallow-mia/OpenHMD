@@ -104,6 +104,15 @@ void rift_tracker_config_load(ohmd_context *ctx, rift_tracker_config *config)
 			goto fail_parse;
 		if (!json_read_quat(item, "orient", &sensor->pose.orient))
 			goto fail_parse;
+
+		/* Optional - absent in configs written before this existed and in
+		 * those produced by the offline solver. */
+		sensor->viewpoints = 0;
+		{
+			const nx_json *vp = nx_json_get(item, "viewpoints");
+			if (vp->type == NX_JSON_INTEGER)
+				sensor->viewpoints = (int) vp->int_value;
+		}
 	}
 	config->n_sensors = i;
 
@@ -164,11 +173,13 @@ void rift_tracker_config_save(ohmd_context *ctx, rift_tracker_config *config)
 				"    {\n"
 				"       \"serial\": \"%s\",\n"
 				"       \"pos\": [ %f, %f, %f ],\n"
-				"       \"orient\": [ %f, %f, %f, %f ]\n"
+				"       \"orient\": [ %f, %f, %f, %f ],\n"
+				"       \"viewpoints\": %d\n"
 				"    }",
 				sensor->serial_no,
 				sensor->pose.pos.x, sensor->pose.pos.y, sensor->pose.pos.z,
-				sensor->pose.orient.x, sensor->pose.orient.y, sensor->pose.orient.z, sensor->pose.orient.w))
+				sensor->pose.orient.x, sensor->pose.orient.y, sensor->pose.orient.z, sensor->pose.orient.w,
+				sensor->viewpoints))
 			goto fail_serialise;
 
 		/* Print trailing comma, or just end the line for the last entry */
@@ -229,6 +240,36 @@ rift_tracker_config_set_sensor_pose(rift_tracker_config *config, const char *ser
 
 	sensor_cfg->pose = *pose;
 	config->modified = true;
+}
+
+void
+rift_tracker_config_set_sensor_viewpoints(rift_tracker_config *config, const char *serial_no, int viewpoints)
+{
+	int i;
+
+	for (i = 0; i < config->n_sensors; i++) {
+		rift_tracker_sensor_config *cur = config->sensors + i;
+		if (strcmp(cur->serial_no, serial_no) == 0) {
+			if (cur->viewpoints != viewpoints) {
+				cur->viewpoints = viewpoints;
+				config->modified = true;
+			}
+			return;
+		}
+	}
+}
+
+int
+rift_tracker_config_get_sensor_viewpoints(rift_tracker_config *config, const char *serial_no)
+{
+	int i;
+
+	for (i = 0; i < config->n_sensors; i++) {
+		rift_tracker_sensor_config *cur = config->sensors + i;
+		if (strcmp(cur->serial_no, serial_no) == 0)
+			return cur->viewpoints;
+	}
+	return 0;
 }
 
 bool

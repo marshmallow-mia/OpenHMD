@@ -2251,6 +2251,7 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	posef rel, rel_in_use, anchor_world, newp, cur;
 	rift_cam_calib snapshot;
 	int idx;
+	int stored_views = 0;
 	bool adopted;
 
 	if (!auto_calib_enabled() || ctx->n_sensors < 2)
@@ -2312,6 +2313,34 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 			return;
 		}
 
+		/* A calibration fitted over MORE viewpoints must not be replaced by
+		 * one fitted over fewer, however good the newcomer looks. It looks
+		 * good precisely because it is being scored against the single
+		 * narrow history it came from: measured over three real headset
+		 * positions, a one-viewpoint fit scores 0.2-0.6 px at its own spot
+		 * and 2.3-3.8 px at the others, while the three-viewpoint fit stays
+		 * under 2 px everywhere. Without this, every restart with the
+		 * headset sitting still would overwrite an accumulated calibration
+		 * with an overfit one - measured doing exactly that, by 20 mm. */
+		ohmd_lock_mutex(ctx->tracker_lock);
+		stored_views = rift_tracker_config_get_sensor_viewpoints(&ctx->config,
+			rift_sensor_serial_no(sensor));
+		ohmd_unlock_mutex(ctx->tracker_lock);
+
+		if (snapshot.bins_seen < stored_views) {
+			if (!adopted) {
+				LOGI("sensor %s: keeping the stored calibration - it was fitted "
+					"over %d viewpoints and this session has seen %u "
+					"(it leaves %.2f px here)",
+					rift_sensor_serial_no(sensor), stored_views,
+					snapshot.bins_seen, r_in_use);
+				ohmd_lock_mutex(ctx->calib_lock);
+				ctx->cam_calib_adopted[idx] = true;
+				ohmd_unlock_mutex(ctx->calib_lock);
+			}
+			return;
+		}
+
 		/* Otherwise only replace it for a real improvement, on the runtime's
 		 * own 15% bar. Setting the headset down somewhere new does not clear
 		 * this, which is the point. */
@@ -2329,10 +2358,10 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 		dang = 2.0f * acosf(OHMD_MIN(1.0f, fabsf(dq.w)));
 	}
 
-	LOGI("sensor %s: %s calibration from %u poses over %u viewpoints, "
-		"residual %.2f px%s",
+	LOGI("sensor %s: %s calibration from %u poses over %u viewpoints "
+		"(stored: %d), residual %.2f px%s",
 		rift_sensor_serial_no(sensor), adopted ? "re-solved" : "adopted",
-		snapshot.n_hist, snapshot.bins_seen, r_est,
+		snapshot.n_hist, snapshot.bins_seen, stored_views, r_est,
 		snapshot.settled ? " - SETTLED" : " (estimated)");
 	if (had_pose) {
 		LOGI("sensor %s: %s calibration left %.2f px; moving the sensor "
@@ -2343,6 +2372,10 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	}
 	rift_sensor_set_pose(sensor, &newp);
 	rift_tracker_update_sensor_pose(ctx, sensor, &newp);
+	ohmd_lock_mutex(ctx->tracker_lock);
+	rift_tracker_config_set_sensor_viewpoints(&ctx->config,
+		rift_sensor_serial_no(sensor), snapshot.bins_seen);
+	ohmd_unlock_mutex(ctx->tracker_lock);
 	notify_camera_moved(ctx, &d, dang);
 
 	/* The online refiner's window measures mismatch against the pose that
