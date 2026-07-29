@@ -1734,7 +1734,19 @@ static void get_device_list(ohmd_driver* driver, ohmd_device_list* list)
 				desc->revision = rd[i].rev;
 		
 				desc->device_class = OHMD_DEVICE_CLASS_HMD;
-				desc->device_flags = OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING;
+				/* Constellation tracking gives this HMD position as well as
+				 * orientation - the Touch descriptors below already say so,
+				 * and the HMD's own solve is the better of the two. Runtimes
+				 * that pick a 3dof or 6dof device model from these flags
+				 * (Monado's ohmd driver does, and defaults everything to 3dof
+				 * otherwise) would throw the positional solve away.
+				 *
+				 * This is a capability, not a claim that position is being
+				 * tracked right now: with no sensors connected the driver
+				 * reports a zero position, and OHMD_POSITION_VECTOR readers
+				 * are expected to treat that as untracked. */
+				desc->device_flags = OHMD_DEVICE_FLAGS_ROTATIONAL_TRACKING |
+					OHMD_DEVICE_FLAGS_POSITIONAL_TRACKING;
 
 				strcpy(desc->path, cur_dev->path);
 
