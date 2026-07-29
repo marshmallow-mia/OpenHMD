@@ -278,8 +278,7 @@ struct rift_tracker_ctx_s
 	rift_calib_exposure calib_exp[RIFT_CALIB_EXP_SLOTS];
 	int calib_exp_next;
 	rift_cam_calib cam_calib[RIFT_MAX_SENSORS];
-	/* sample count the estimate had when it was last adopted; 0 = never */
-	uint32_t cam_calib_adopted_n[RIFT_MAX_SENSORS];
+	bool cam_calib_adopted[RIFT_MAX_SENSORS];
 	uint32_t cam_calib_pairs;
 
 	ohmd_thread* usb_thread;
@@ -2228,13 +2227,13 @@ void rift_tracker_add_calib_obs(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor,
 	/* Everything is measured relative to sensor 0, the same anchor the
 	 * online refinement uses. */
 	if (idx != 0 && e->have[0]) {
-		if (rift_cam_calib_add(ctx->cam_calib + idx, e->obj_cam + 0, e->obj_cam + idx))
-			ctx->cam_calib_pairs++;
+		rift_cam_calib_add(ctx->cam_calib + idx, e->obj_cam + 0, e->obj_cam + idx);
+		ctx->cam_calib_pairs++;
 	} else if (idx == 0) {
 		for (i = 1; i < ctx->n_sensors; i++) {
 			if (e->have[i]) {
-				if (rift_cam_calib_add(ctx->cam_calib + i, e->obj_cam + 0, e->obj_cam + i))
-					ctx->cam_calib_pairs++;
+				rift_cam_calib_add(ctx->cam_calib + i, e->obj_cam + 0, e->obj_cam + i);
+				ctx->cam_calib_pairs++;
 			}
 		}
 	}
@@ -2252,7 +2251,6 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	posef rel, rel_in_use, anchor_world, newp, cur;
 	rift_cam_calib snapshot;
 	int idx;
-	uint32_t adopted_n;
 	bool adopted;
 
 	if (!auto_calib_enabled() || ctx->n_sensors < 2)
@@ -2264,11 +2262,10 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 
 	ohmd_lock_mutex(ctx->calib_lock);
 	snapshot = ctx->cam_calib[idx];
-	adopted_n = ctx->cam_calib_adopted_n[idx];
-	adopted = adopted_n != 0;
+	adopted = ctx->cam_calib_adopted[idx];
 	ohmd_unlock_mutex(ctx->calib_lock);
 
-	if (snapshot.state != RIFT_CAM_CALIBRATED || !snapshot.settled)
+	if (snapshot.n_hist < RIFT_CAM_CALIB_MIN_SAMPLES)
 		return;
 	if (!rift_cam_calib_get(&snapshot, &rel))
 		return;
@@ -2283,29 +2280,43 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	bool had_pose = rift_sensor_have_pose(sensor);
 	vec3f d = {{ 0, 0, 0 }};
 	float dang = 0.0f;
-	float stale_ang = 0.0f, stale_pos = 0.0f;
+	float r_in_use = -1.0f;
+	float r_est = rift_cam_calib_residual_px(&snapshot, &rel);
 
 	if (had_pose) {
 		/* What the poses currently in use claim the relative geometry is.
 		 * On the first pass that IS the stored room config, so this is
-		 * where a stale file is caught; later it is the pose we ourselves
-		 * adopted, so a sensor knocked mid-session is caught the same way.
-		 * Either is only overruled by a settled estimate, and only when it
-		 * disagrees by more than refinement could account for. */
+		 * where a stale file is caught; afterwards it is the pose we
+		 * adopted ourselves, so a knocked sensor is caught the same way. */
 		posef ref_inv = anchor_world;
 		rift_sensor_get_pose(sensor, &cur);
 		oposef_inverse(&ref_inv);
 		oposef_apply(&cur, &ref_inv, &rel_in_use);
-		rift_cam_calib_compare(&snapshot, &rel_in_use, &stale_ang, &stale_pos);
+		r_in_use = rift_cam_calib_residual_px(&snapshot, &rel_in_use);
 
-		/* Take the estimate again once it is properly averaged, then stop
-		 * chasing it -- past that only a real disagreement reopens this. */
-		bool worth_refining = adopted_n < RIFT_CAM_CALIB_REFINED_SAMPLES &&
-			snapshot.n >= RIFT_CAM_CALIB_REFINED_SAMPLES;
+		/* A pose that cannot describe the observed history AT ALL means the
+		 * camera itself moved, not that the headset did - the two differ by
+		 * ~600x in this measure. The history now straddles the move, so it
+		 * is worthless; drop it and rebuild ("Invalid calibration:
+		 * resetting history"). */
+		if (rift_cam_calib_camera_moved(&snapshot, &rel_in_use)) {
+			LOGI("sensor %s: camera moved - the calibration in use leaves "
+				"%.1f px over %u observations (>%.0f px). Resetting history.",
+				rift_sensor_serial_no(sensor), r_in_use, snapshot.n_hist,
+				(double) RIFT_CAM_CALIB_MOVED_PX);
+			ohmd_lock_mutex(ctx->calib_lock);
+			rift_cam_calib_reset(ctx->cam_calib + idx);
+			ctx->cam_calib[idx].n_resets++;
+			ctx->cam_calib_adopted[idx] = false;
+			ohmd_unlock_mutex(ctx->calib_lock);
+			return;
+		}
 
-		if (adopted && !worth_refining &&
-		    !rift_cam_calib_rejects(&snapshot, &rel_in_use))
-			return; /* the pose in use still matches what we measure */
+		/* Otherwise only replace it for a real improvement, on the runtime's
+		 * own 15% bar. Setting the headset down somewhere new does not clear
+		 * this, which is the point. */
+		if (adopted && !(r_est < r_in_use * RIFT_CAM_CALIB_IMPROVE_GATE))
+			return;
 	}
 
 	rift_cam_calib_to_world(&anchor_world, &rel, &newp);
@@ -2318,21 +2329,17 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 		dang = 2.0f * acosf(OHMD_MIN(1.0f, fabsf(dq.w)));
 	}
 
-	float dev_ang, dev_pos;
-	rift_cam_calib_dev(&snapshot, &dev_ang, &dev_pos);
-	LOGI("sensor %s: automatic calibration adopted after %u exposures "
-		"(%u rejected, scatter %.3f deg / %.1f mm)%s",
-		rift_sensor_serial_no(sensor), snapshot.n, snapshot.n_rejected,
-		RAD_TO_DEG(dev_ang), dev_pos * 1000.0f,
-		had_pose ? "" : " - sensor had no pose at all");
+	LOGI("sensor %s: %s calibration from %u poses over %u viewpoints, "
+		"residual %.2f px%s",
+		rift_sensor_serial_no(sensor), adopted ? "re-solved" : "adopted",
+		snapshot.n_hist, snapshot.bins_seen, r_est,
+		snapshot.settled ? " - SETTLED" : " (estimated)");
 	if (had_pose) {
-		LOGI("sensor %s: %s calibration was %.2f deg / %.1f mm from what is "
-			"measured - moving the sensor %.1f mm / %.2f deg%s",
+		LOGI("sensor %s: %s calibration left %.2f px; moving the sensor "
+			"%.1f mm / %.2f deg",
 			rift_sensor_serial_no(sensor),
-			adopted ? "its previous" : "the stored",
-			RAD_TO_DEG(stale_ang), stale_pos * 1000.0f,
-			ovec3f_get_length(&d) * 1000.0f, RAD_TO_DEG(dang),
-			snapshot.n_resets > 0 ? " (history was rebuilt - it had been moved)" : "");
+			adopted ? "its previous" : "the stored", r_in_use,
+			ovec3f_get_length(&d) * 1000.0f, RAD_TO_DEG(dang));
 	}
 	rift_sensor_set_pose(sensor, &newp);
 	rift_tracker_update_sensor_pose(ctx, sensor, &newp);
@@ -2351,7 +2358,7 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	ohmd_unlock_mutex(ctx->refine_lock);
 
 	ohmd_lock_mutex(ctx->calib_lock);
-	ctx->cam_calib_adopted_n[idx] = snapshot.n;
+	ctx->cam_calib_adopted[idx] = true;
 	ohmd_unlock_mutex(ctx->calib_lock);
 }
 
