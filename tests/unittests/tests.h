@@ -57,6 +57,7 @@ void test_rift_joint_pose_rejects_thin_data();
 
 // 6DOF UKF tests
 void test_rift_kalman_stationary();
+void test_rift_kalman_five_delay_slots();
 void test_rift_kalman_two_sample_rates();
 void test_rift_kalman_delayed_position_update();
 void test_rift_fusion_ovr_saturated_accel_ignored();

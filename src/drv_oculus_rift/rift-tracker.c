@@ -43,8 +43,15 @@
 /* Number of IMU observations we accumulate before output */
 #define RIFT_MAX_PENDING_IMU_OBSERVATIONS 1000
 
-/* Number of state slots to use for quat/position updates */
-#define NUM_POSE_DELAY_SLOTS 3
+/* Number of state slots to use for quat/position updates. Each slot holds one
+ * exposure open until every sensor that saw it has reported, so this is also
+ * how long a slow sensor has to deliver before its observation is dropped
+ * entirely -- and a dropped observation costs the joint reconstruction its
+ * second view, not just one correction. At 3 that was ~58 ms at the 52 Hz
+ * exposure rate, and the live test measured a reacquiring sensor at ~100 ms.
+ * Both fusion backends already size their arrays for 5 (MAX_DELAY_SLOTS,
+ * RIFT_FUSION_OVR_MAX_SLOTS), so the headroom is free. */
+#define NUM_POSE_DELAY_SLOTS 5
 
 /* Number of exposure history slots to keep */
 #define NUM_EXPOSURE_HISTORY 3
@@ -134,6 +141,12 @@ struct rift_tracked_device_priv {
 	int n_led_pos;
 	/* Joint reconstruction telemetry */
 	uint32_t joint_solved, joint_rejected, joint_single;
+	/* Observations that arrived after their exposure's delay slot was
+	 * recycled. These are invisible in the joint counters -- the exposure
+	 * simply looks single-camera -- so count them separately, otherwise a
+	 * timing problem is indistinguishable from a sensor not seeing the
+	 * device. */
+	uint32_t reports_dropped_late;
 	uint32_t imu_saturated_samples;
 	rift_sync_monitor sync;
 
@@ -1504,6 +1517,16 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 	}
 
 	slot = get_matching_delay_slot(dev, dev_info);
+	if (slot == NULL) {
+		dev->reports_dropped_late++;
+		if ((dev->reports_dropped_late % 100) == 1) {
+			LOGW("Device %d: %u observations dropped because their exposure's "
+				"delay slot had already been recycled (latest from %s, %.1f ms "
+				"old) - the joint reconstruction loses a view each time",
+				dev->base.id, dev->reports_dropped_late, source,
+				(double)(dev->device_time_ns - frame_device_time_ns) / 1000000.0);
+		}
+	}
 	if (slot != NULL) {
 		quatf orient_diff;
 		vec3f pos_error, rot_error;
@@ -1671,8 +1694,10 @@ bool rift_tracked_device_model_pose_update(rift_tracked_device *dev_base, uint64
 				}
 
 				if (merged && (dev->joint_solved % 300) == 1) {
-					LOGI("Device %d: joint reconstruction %u solved, %u rejected, %u single-camera",
-						dev->base.id, dev->joint_solved, dev->joint_rejected, dev->joint_single);
+					LOGI("Device %d: joint reconstruction %u solved, %u rejected, "
+						"%u single-camera (%u observations arrived too late to count)",
+						dev->base.id, dev->joint_solved, dev->joint_rejected,
+						dev->joint_single, dev->reports_dropped_late);
 				}
 			}
 

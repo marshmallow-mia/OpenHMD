@@ -19,8 +19,17 @@
 /* Run `seconds` of a perfectly stationary, level device at `hz`, with a pose
  * observation every 20 ms (roughly the CV1 camera cadence). Returns the final
  * fused pose and its reported position uncertainty. */
+static void run_stationary_slots(double seconds, int hz, int n_slots,
+	posef *out_pose, vec3f *out_vel, vec3f *out_pos_err);
+
 static void run_stationary(double seconds, int hz, posef *out_pose,
 	vec3f *out_vel, vec3f *out_pos_err)
+{
+	run_stationary_slots(seconds, hz, 3, out_pose, out_vel, out_pos_err);
+}
+
+static void run_stationary_slots(double seconds, int hz, int n_slots,
+	posef *out_pose, vec3f *out_vel, vec3f *out_pos_err)
 {
 	rift_kalman_6dof_filter f;
 	posef truth;
@@ -30,7 +39,7 @@ static void run_stationary(double seconds, int hz, posef *out_pose,
 	ovec3f_set(&truth.pos, 0.10f, 1.20f, -1.30f);
 	oquatf_set(&truth.orient, 0.0f, 0.0f, 0.0f, 1.0f);
 
-	rift_kalman_6dof_init(&f, &truth, 3);
+	rift_kalman_6dof_init(&f, &truth, n_slots);
 
 	const uint64_t step_ns = (uint64_t)(1000000000.0 / hz);
 	const uint64_t n = (uint64_t)(seconds * hz);
@@ -42,7 +51,7 @@ static void run_stationary(double seconds, int hz, posef *out_pose,
 		rift_kalman_6dof_imu_update(&f, t, &gyro, &accel, NULL, false);
 
 		if (obs_every > 0 && (i % obs_every) == 0) {
-			int slot = (int)((i / obs_every) % 3);
+			int slot = (int)((i / obs_every) % n_slots);
 			rift_kalman_6dof_prepare_delay_slot(&f, t, slot);
 			rift_kalman_6dof_pose_update(&f, t, &truth, slot, 1.0f);
 			rift_kalman_6dof_release_delay_slot(&f, slot);
@@ -68,6 +77,33 @@ void test_rift_kalman_stationary()
 	TAssert(vec3f_eq(pose.pos, truth_pos, 0.01f));      /* within 1 cm */
 	TAssert(ovec3f_get_length(&vel) < 0.05f);           /* not drifting */
 	TAssert(ovec3f_get_length(&pos_err) < 0.5f);        /* covariance sane */
+}
+
+/* The delay-slot ring was widened to 5 (rift-tracker.c NUM_POSE_DELAY_SLOTS)
+ * so a sensor that reports late still finds its exposure open. Each slot adds
+ * state and covariance to the UKF, and this filter has been fragile before --
+ * an earlier change made the Cholesky factorisation fail on a covariance that
+ * had stopped being positive definite. So the widened filter has to be shown
+ * to behave, not assumed to. */
+void test_rift_kalman_five_delay_slots()
+{
+	posef p3, p5;
+	vec3f v3, v5, e3, e5;
+	vec3f truth_pos = {{ 0.10f, 1.20f, -1.30f }};
+
+	run_stationary_slots(2.0, 1000, 3, &p3, &v3, &e3);
+	run_stationary_slots(2.0, 1000, 5, &p5, &v5, &e5);
+
+	TAssert(isfinite(p5.pos.x) && isfinite(p5.pos.y) && isfinite(p5.pos.z));
+	TAssert(isfinite(p5.orient.w));
+	TAssert(vec3f_eq(p5.pos, truth_pos, 0.01f));
+	TAssert(ovec3f_get_length(&v5) < 0.05f);
+
+	/* two more slots must not change the answer or the confidence in it */
+	TAssert(vec3f_eq(p3.pos, p5.pos, 0.005f));
+	float a = ovec3f_get_length(&e3), b = ovec3f_get_length(&e5);
+	TAssert(a > 0.0f && b > 0.0f);
+	TAssert(fabsf(a - b) / (a > b ? a : b) < 0.25f);
 }
 
 /* The filter must converge to the same answer whether it is fed at 1 kHz or
