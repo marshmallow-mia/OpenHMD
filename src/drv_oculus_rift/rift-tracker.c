@@ -278,7 +278,8 @@ struct rift_tracker_ctx_s
 	rift_calib_exposure calib_exp[RIFT_CALIB_EXP_SLOTS];
 	int calib_exp_next;
 	rift_cam_calib cam_calib[RIFT_MAX_SENSORS];
-	bool cam_calib_adopted[RIFT_MAX_SENSORS];
+	/* sample count the estimate had when it was last adopted; 0 = never */
+	uint32_t cam_calib_adopted_n[RIFT_MAX_SENSORS];
 	uint32_t cam_calib_pairs;
 
 	ohmd_thread* usb_thread;
@@ -2251,6 +2252,7 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	posef rel, rel_in_use, anchor_world, newp, cur;
 	rift_cam_calib snapshot;
 	int idx;
+	uint32_t adopted_n;
 	bool adopted;
 
 	if (!auto_calib_enabled() || ctx->n_sensors < 2)
@@ -2262,7 +2264,8 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 
 	ohmd_lock_mutex(ctx->calib_lock);
 	snapshot = ctx->cam_calib[idx];
-	adopted = ctx->cam_calib_adopted[idx];
+	adopted_n = ctx->cam_calib_adopted_n[idx];
+	adopted = adopted_n != 0;
 	ohmd_unlock_mutex(ctx->calib_lock);
 
 	if (snapshot.state != RIFT_CAM_CALIBRATED || !snapshot.settled)
@@ -2295,7 +2298,13 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 		oposef_apply(&cur, &ref_inv, &rel_in_use);
 		rift_cam_calib_compare(&snapshot, &rel_in_use, &stale_ang, &stale_pos);
 
-		if (adopted && !rift_cam_calib_rejects(&snapshot, &rel_in_use))
+		/* Take the estimate again once it is properly averaged, then stop
+		 * chasing it -- past that only a real disagreement reopens this. */
+		bool worth_refining = adopted_n < RIFT_CAM_CALIB_REFINED_SAMPLES &&
+			snapshot.n >= RIFT_CAM_CALIB_REFINED_SAMPLES;
+
+		if (adopted && !worth_refining &&
+		    !rift_cam_calib_rejects(&snapshot, &rel_in_use))
 			return; /* the pose in use still matches what we measure */
 	}
 
@@ -2317,14 +2326,14 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 		RAD_TO_DEG(dev_ang), dev_pos * 1000.0f,
 		had_pose ? "" : " - sensor had no pose at all");
 	if (had_pose) {
-		LOGI("sensor %s: %s calibration was wrong by %.2f deg / %.1f mm - "
-			"moving the sensor %.1f mm / %.2f deg to where it is actually seen%s",
-			rift_sensor_serial_no(sensor), adopted ? "its previous" : "the stored",
+		LOGI("sensor %s: %s calibration was %.2f deg / %.1f mm from what is "
+			"measured - moving the sensor %.1f mm / %.2f deg%s",
+			rift_sensor_serial_no(sensor),
+			adopted ? "its previous" : "the stored",
 			RAD_TO_DEG(stale_ang), stale_pos * 1000.0f,
 			ovec3f_get_length(&d) * 1000.0f, RAD_TO_DEG(dang),
 			snapshot.n_resets > 0 ? " (history was rebuilt - it had been moved)" : "");
 	}
-
 	rift_sensor_set_pose(sensor, &newp);
 	rift_tracker_update_sensor_pose(ctx, sensor, &newp);
 	notify_camera_moved(ctx, &d, dang);
@@ -2342,7 +2351,7 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 	ohmd_unlock_mutex(ctx->refine_lock);
 
 	ohmd_lock_mutex(ctx->calib_lock);
-	ctx->cam_calib_adopted[idx] = true;
+	ctx->cam_calib_adopted_n[idx] = snapshot.n;
 	ohmd_unlock_mutex(ctx->calib_lock);
 }
 
