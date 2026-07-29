@@ -253,3 +253,56 @@ void test_rift_cam_calib_rejects_outliers()
 	TAssert(pose_pos_err(&before, &after) < 1e-6f);   /* untouched */
 	TAssert(pose_pos_err(&after, &truth) < 0.005f);
 }
+
+/* A sensor knocked mid-session. Every sample after the knock is a legitimate
+ * 3-sigma outlier against the pre-knock mean, so a plain sigma gate defends
+ * the stale geometry indefinitely and the sensor never recovers. The run
+ * detector has to notice and rebuild. */
+void test_rift_cam_calib_recovers_from_a_bumped_sensor()
+{
+	posef cam_ref, cam_other, cam_moved, obj, truth_before, truth_after, got;
+	rift_cam_calib c;
+	int i;
+
+	pose_make(&cam_ref, 0.49f, 1.56f, -1.62f, 0.0f, 1.0f, 0.0f, 0.10f);
+	pose_make(&cam_other, -0.74f, 1.84f, -1.54f, 0.0f, 1.0f, 0.0f, -0.40f);
+	/* knocked: 8 deg round and 12 cm along */
+	pose_make(&cam_moved, -0.62f, 1.84f, -1.50f, 0.0f, 1.0f, 0.0f, -0.26f);
+	pose_make(&obj, 0.0f, 1.05f, -0.35f, 0.1f, 1.0f, 0.0f, 0.3f);
+	relative_truth(&cam_ref, &cam_other, &truth_before);
+	relative_truth(&cam_ref, &cam_moved, &truth_after);
+	TAssert(pose_pos_err(&truth_before, &truth_after) > 0.05f);
+
+	rift_cam_calib_init(&c);
+	for (i = 0; i < 300; i++) {
+		posef ocr, oco;
+		obj_in_cam(&obj, &cam_ref, &ocr);
+		obj_in_cam(&obj, &cam_other, &oco);
+		perturb(&ocr, i, 0.002f, 0.002f);
+		perturb(&oco, i + 3, 0.002f, 0.002f);
+		rift_cam_calib_add(&c, &ocr, &oco);
+	}
+	TAssert(c.state == RIFT_CAM_CALIBRATED);
+	rift_cam_calib_get(&c, &got);
+	TAssert(pose_pos_err(&got, &truth_before) < 0.005f);
+	TAssert(c.n_resets == 0);
+
+	/* someone knocks it */
+	for (i = 300; i < 700; i++) {
+		posef ocr, oco;
+		obj_in_cam(&obj, &cam_ref, &ocr);
+		obj_in_cam(&obj, &cam_moved, &oco);
+		perturb(&ocr, i, 0.002f, 0.002f);
+		perturb(&oco, i + 3, 0.002f, 0.002f);
+		rift_cam_calib_add(&c, &ocr, &oco);
+	}
+
+	TAssert(c.n_resets >= 1);                /* the history was thrown away */
+	TAssert(c.state == RIFT_CAM_CALIBRATED); /* and rebuilt */
+	TAssert(c.settled);
+	rift_cam_calib_get(&c, &got);
+	TAssert(pose_pos_err(&got, &truth_after) < 0.005f);
+	TAssert(pose_ang_err(&got, &truth_after) < 0.01f);
+	/* and it now rejects the geometry it used to hold */
+	TAssert(rift_cam_calib_rejects(&c, &truth_before));
+}

@@ -52,6 +52,13 @@
  * The failure that motivated this module was 9 deg / 214 mm. */
 #define RIFT_CAM_CALIB_REJECT_ANG 0.035f    /* 2 deg */
 #define RIFT_CAM_CALIB_REJECT_POS 0.050f    /* 50 mm */
+/* Noise produces scattered rejections; a sensor that was knocked produces an
+ * unbroken run of them, because every sample now agrees with a geometry the
+ * mean no longer describes. Past this many in a row the history is the thing
+ * that is wrong, so it is thrown away and rebuilt from the current sample --
+ * without this the estimate defends its own stale mean forever. ~1.2 s at the
+ * 52 Hz exposure rate. */
+#define RIFT_CAM_CALIB_BUMP_RUN 60
 
 typedef enum {
 	/* nothing known — the sensor cannot contribute to tracking */
@@ -72,6 +79,8 @@ typedef struct {
 	vec3f mean_pos;
 	uint32_t n;              /* samples folded into the mean */
 	uint32_t n_rejected;     /* outliers dropped */
+	uint32_t n_consec_rejects; /* unbroken run of them - see BUMP_RUN */
+	uint32_t n_resets;       /* histories thrown away after such a run */
 
 	/* dispersion about the mean, as running means of the per-sample
 	 * deviation — cheap, and enough for a settle test and a sigma gate.

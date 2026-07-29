@@ -68,6 +68,7 @@ void test_rift_cam_calib_single_exposure_is_enough();
 void test_rift_cam_calib_averages_and_settles();
 void test_rift_cam_calib_rejects_stale_stored_calibration();
 void test_rift_cam_calib_rejects_outliers();
+void test_rift_cam_calib_recovers_from_a_bumped_sensor();
 
 // exposure/frame/pose timing monitor
 void test_rift_sync_monitor_clean_stream();

@@ -117,17 +117,36 @@ bool rift_cam_calib_add(rift_cam_calib *c, const posef *obj_cam_ref,
 	d_pos = ovec3f_get_length(&dp);
 
 	/* Reject once there is enough history for the deviation to mean
-	 * something. A bumped sensor produces a sustained run of "outliers", so
-	 * the caller watches n_rejected and resets rather than relying on this
-	 * to track a real move. */
+	 * something. A bumped sensor produces a sustained RUN of "outliers"
+	 * rather than scattered ones, which is how the two are told apart
+	 * below — otherwise the estimate would defend its stale mean forever. */
 	rift_cam_calib_dev(c, &dev_ang, &dev_pos);
 	if (c->n >= RIFT_CAM_CALIB_MIN_SAMPLES && dev_ang > 0.0f && dev_pos > 0.0f) {
 		if (d_ang > RIFT_CAM_CALIB_OUTLIER_SIGMA * dev_ang ||
 		    d_pos > RIFT_CAM_CALIB_OUTLIER_SIGMA * dev_pos) {
 			c->n_rejected++;
-			return false;
+			if (++c->n_consec_rejects < RIFT_CAM_CALIB_BUMP_RUN)
+				return false;
+
+			/* Every recent sample disagrees with the mean, so it is the
+			 * mean that is stale: the sensor was moved. Start again from
+			 * THIS sample rather than discarding it too, which would leave
+			 * nothing to rebuild from. */
+			{
+				uint32_t rejected = c->n_rejected, resets = c->n_resets;
+				rift_cam_calib_init(c);
+				c->n_rejected = rejected;
+				c->n_resets = resets + 1;
+			}
+			c->mean_orient = rel.orient;
+			oquatf_normalize_me(&c->mean_orient);
+			c->mean_pos = rel.pos;
+			c->n = 1;
+			c->state = RIFT_CAM_ESTIMATED;
+			return true;
 		}
 	}
+	c->n_consec_rejects = 0;
 
 	c->n++;
 

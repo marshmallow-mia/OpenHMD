@@ -2223,7 +2223,7 @@ void rift_tracker_add_calib_obs(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor,
  * sensor that has never contributed a fix does not get one. */
 void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor)
 {
-	posef rel, anchor_world, newp, cur;
+	posef rel, rel_in_use, anchor_world, newp, cur;
 	rift_cam_calib snapshot;
 	int idx;
 	bool adopted;
@@ -2242,8 +2242,6 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 
 	if (snapshot.state != RIFT_CAM_CALIBRATED || !snapshot.settled)
 		return;
-	if (adopted)
-		return;
 	if (!rift_cam_calib_get(&snapshot, &rel))
 		return;
 
@@ -2254,14 +2252,31 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 		return;
 	rift_sensor_get_pose(ctx->sensors[0], &anchor_world);
 
-	rift_cam_calib_to_world(&anchor_world, &rel, &newp);
-
 	bool had_pose = rift_sensor_have_pose(sensor);
 	vec3f d = {{ 0, 0, 0 }};
 	float dang = 0.0f;
+	float stale_ang = 0.0f, stale_pos = 0.0f;
 
 	if (had_pose) {
+		/* What the poses currently in use claim the relative geometry is.
+		 * On the first pass that IS the stored room config, so this is
+		 * where a stale file is caught; later it is the pose we ourselves
+		 * adopted, so a sensor knocked mid-session is caught the same way.
+		 * Either is only overruled by a settled estimate, and only when it
+		 * disagrees by more than refinement could account for. */
+		posef ref_inv = anchor_world;
 		rift_sensor_get_pose(sensor, &cur);
+		oposef_inverse(&ref_inv);
+		oposef_apply(&cur, &ref_inv, &rel_in_use);
+		rift_cam_calib_compare(&snapshot, &rel_in_use, &stale_ang, &stale_pos);
+
+		if (adopted && !rift_cam_calib_rejects(&snapshot, &rel_in_use))
+			return; /* the pose in use still matches what we measure */
+	}
+
+	rift_cam_calib_to_world(&anchor_world, &rel, &newp);
+
+	if (had_pose) {
 		ovec3f_subtract(&newp.pos, &cur.pos, &d);
 		quatf inv = cur.orient, dq;
 		oquatf_inverse(&inv);
@@ -2277,9 +2292,12 @@ void rift_tracker_cam_calib_apply(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor
 		RAD_TO_DEG(dev_ang), dev_pos * 1000.0f,
 		had_pose ? "" : " - sensor had no pose at all");
 	if (had_pose) {
-		LOGI("sensor %s: moved %.1f mm / %.2f deg from the pose it was using",
-			rift_sensor_serial_no(sensor), ovec3f_get_length(&d) * 1000.0f,
-			RAD_TO_DEG(dang));
+		LOGI("sensor %s: %s calibration was wrong by %.2f deg / %.1f mm - "
+			"moving the sensor %.1f mm / %.2f deg to where it is actually seen%s",
+			rift_sensor_serial_no(sensor), adopted ? "its previous" : "the stored",
+			RAD_TO_DEG(stale_ang), stale_pos * 1000.0f,
+			ovec3f_get_length(&d) * 1000.0f, RAD_TO_DEG(dang),
+			snapshot.n_resets > 0 ? " (history was rebuilt - it had been moved)" : "");
 	}
 
 	rift_sensor_set_pose(sensor, &newp);
