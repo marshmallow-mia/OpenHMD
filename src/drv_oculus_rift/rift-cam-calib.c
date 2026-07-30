@@ -265,17 +265,31 @@ static void history_store(rift_cam_calib *c, const posef *ref, const posef *othe
 		idx = c->n_hist++;
 	} else {
 		uint16_t fullest = 0, i, victim = 0;
+		uint32_t oldest = 0;
+		bool have_victim = false;
 
 		for (i = 0; i < RIFT_CAM_CALIB_BINS; i++) {
 			if (c->bin_count[i] > c->bin_count[fullest])
 				fullest = i;
 		}
+		/* The OLDEST entry of that bucket, not the lowest-indexed one.
+		 * Taking the first match by index means a freshly written sample -
+		 * which lands in whichever low slot was just freed - is the first
+		 * thing found next time and is immediately evicted again, so the
+		 * window never turns over: measured 191 of 192 entries still stale
+		 * after 1100 newer samples, leaving the calibration unable to follow
+		 * a sensor that moved while running. */
 		for (i = 0; i < c->n_hist; i++) {
-			if (c->hist[i].bin == fullest) {
+			if (c->hist[i].bin != fullest)
+				continue;
+			if (!have_victim || c->hist[i].seq < oldest) {
+				oldest = c->hist[i].seq;
 				victim = i;
-				break;
+				have_victim = true;
 			}
 		}
+		if (!have_victim)
+			return;
 		c->bin_count[fullest]--;
 		idx = victim;
 	}
@@ -283,6 +297,7 @@ static void history_store(rift_cam_calib *c, const posef *ref, const posef *othe
 	c->hist[idx].obj_cam_ref = *ref;
 	c->hist[idx].obj_cam_other = *other;
 	c->hist[idx].bin = bin;
+	c->hist[idx].seq = c->seq++;
 	if (c->bin_count[bin] == 0)
 		c->bins_seen++;
 	c->bin_count[bin]++;
@@ -376,6 +391,69 @@ bool rift_cam_calib_get(const rift_cam_calib *c, posef *rel_out)
 	rel_out->orient = c->mean_orient;
 	rel_out->pos = c->mean_pos;
 	return true;
+}
+
+rift_cam_calib_action rift_cam_calib_decide(const rift_cam_calib *c,
+	const posef *rel_in_use, bool adopted, bool recovering,
+	int stored_viewpoints, float *out_r_in_use, float *out_r_est)
+{
+	posef rel;
+	float r_in_use = -1.0f, r_est = -1.0f;
+
+	if (c->n_hist >= RIFT_CAM_CALIB_MIN_SAMPLES && rift_cam_calib_get(c, &rel)) {
+		r_est = rift_cam_calib_residual_px(c, &rel);
+		if (rel_in_use != NULL)
+			r_in_use = rift_cam_calib_residual_px(c, rel_in_use);
+	}
+	if (out_r_in_use != NULL)
+		*out_r_in_use = r_in_use;
+	if (out_r_est != NULL)
+		*out_r_est = r_est;
+
+	if (r_est < 0.0f)
+		return RIFT_CAM_CALIB_WAIT;
+
+	/* Nothing to weigh against: the sensor has no pose at all, so any estimate
+	 * beats none. */
+	if (rel_in_use == NULL)
+		return RIFT_CAM_CALIB_ADOPT;
+
+	/* Recovering from a move the caller has already acted on. The history was
+	 * rebuilt from observations taken AFTER it, so the two tests below are not
+	 * merely unnecessary here, they are actively wrong:
+	 *
+	 *  - camera-moved would compare the fresh history against the same stale
+	 *    pose that triggered the reset, exceed the threshold again, and reset
+	 *    again - forever, at roughly one reset per MIN_SAMPLES exposures. The
+	 *    sensor would keep its wrong pose and never be corrected.
+	 *  - the viewpoint guard would weigh the rebuilt history against a stored
+	 *    viewpoint count describing geometry that no longer exists.
+	 */
+	if (recovering)
+		return RIFT_CAM_CALIB_ADOPT;
+
+	/* A pose that cannot describe the observed history AT ALL means the camera
+	 * itself moved, not that the headset did - the two differ by ~600x in this
+	 * measure. The history straddles the move, so it is worthless. */
+	if (rift_cam_calib_camera_moved(c, rel_in_use))
+		return RIFT_CAM_CALIB_RESET;
+
+	/* A calibration fitted over MORE viewpoints must not be replaced by one
+	 * fitted over fewer, however good the newcomer looks. It looks good
+	 * precisely because it is scored against the narrow history it came from:
+	 * measured over three real headset positions, a one-viewpoint fit scores
+	 * 0.2-0.6 px at its own spot and 2.3-3.8 px at the others, while the
+	 * three-viewpoint fit stays under 2 px everywhere. */
+	if ((int) c->bins_seen < stored_viewpoints)
+		return RIFT_CAM_CALIB_KEEP;
+
+	/* Otherwise only replace it for a real improvement, on the runtime's own
+	 * 15% bar. Setting the headset down somewhere new does not clear this,
+	 * which is the point. */
+	if (adopted && !(r_est < r_in_use * RIFT_CAM_CALIB_IMPROVE_GATE))
+		return RIFT_CAM_CALIB_KEEP;
+
+	return RIFT_CAM_CALIB_ADOPT;
 }
 
 void rift_cam_calib_to_world(const posef *ref_world, const posef *rel,
