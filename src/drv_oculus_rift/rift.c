@@ -165,6 +165,59 @@ static rift_device_priv* rift_device_priv_get(ohmd_device* device)
 	return (rift_device_priv*)device;
 }
 
+/* OHMD_RIFT_DUMP_REPORTS=1 dumps every HID feature report the headset answers,
+ * once, at device open. READS ONLY - nothing is written, so an unknown report
+ * id can at worst return an error.
+ *
+ * This exists to find where the CV1 keeps the live IPD. The DISPLAY_INFO
+ * report carries a lens separation that does not move with the hardware
+ * slider (measured: 63.5 mm across a deliberate slider change), while the
+ * Oculus runtime shows IPD changing live - so some other report has it. Dump
+ * with the slider at both extremes and diff:
+ *
+ *   OHMD_RIFT_DUMP_REPORTS=1 openhmd_simple_example 2>&1 | grep '^\[II\] report'
+ *
+ * The bytes that move are the IPD; this family encodes such values as
+ * int32 little-endian micrometres (READFIXED in packet.c). */
+static void rift_dump_feature_reports(rift_hmd_t* priv)
+{
+	unsigned char buf[FEATURE_BUFFER_SIZE];
+	const char *e = getenv("OHMD_RIFT_DUMP_REPORTS");
+	int id, last;
+
+	if (!(e && (e[0] == '1' || e[0] == 'a')))
+		return;
+
+	/* HAZARD, learned the hard way: sweeping report ids the driver does not
+	 * otherwise use disrupts the headset's keepalive. Twice it left the HMD
+	 * unresponsive mid-sweep ("error sending keepalive" right after 0x0a), and
+	 * once that needed a reboot to clear. So the default sweep stops at the
+	 * ids this driver already reads during normal init, which are known safe.
+	 * OHMD_RIFT_DUMP_REPORTS=all sweeps to 0x20 anyway - only worth it with
+	 * the headset otherwise idle and a reboot acceptable. */
+	last = (e[0] == 'a') ? 0x20 : 0x0a;
+
+	LOGI("dumping HID feature reports 0x01..0x%02x (read-only)%s", last,
+		last < 0x20 ? " - set OHMD_RIFT_DUMP_REPORTS=all to sweep further, "
+		"but it can wedge the headset" : " - THIS CAN WEDGE THE HEADSET");
+	for (id = 0x01; id <= last; id++) {
+		char hex[3 * FEATURE_BUFFER_SIZE + 1];
+		int size, i, n = 0;
+
+		memset(buf, 0, sizeof(buf));
+		buf[0] = (unsigned char) id;
+		size = hid_get_feature_report(priv->handle, buf, FEATURE_BUFFER_SIZE);
+		if (size <= 1)
+			continue;
+
+		for (i = 0; i < size && n < (int) sizeof(hex) - 4; i++)
+			n += snprintf(hex + n, sizeof(hex) - n, "%02x ", buf[i]);
+		hex[n > 0 ? n - 1 : 0] = '\0';
+
+		LOGI("report 0x%02x (%2d bytes): %s", id, size, hex);
+	}
+}
+
 static int get_feature_report(rift_hmd_t* priv, rift_sensor_feature_cmd cmd, unsigned char* buf)
 {
 	memset(buf, 0, FEATURE_BUFFER_SIZE);
@@ -1634,6 +1687,8 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 		imu_calibration.accel_matrix[i] = priv->imu_calibration.accel_matrix[i/3][i%3];
 		imu_calibration.gyro_matrix[i] = priv->imu_calibration.gyro_matrix[i/3][i%3];
 	}
+	rift_dump_feature_reports(priv);
+
 	/* The frame everything below is expressed in, reported once because it is
 	 * otherwise invisible (the packet dumps are LOGD, compiled out by default)
 	 * and because the pose handed to a VR runtime is in THIS frame - so where
