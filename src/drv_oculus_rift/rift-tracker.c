@@ -1348,15 +1348,50 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		 * EMA with a ~25 ms time constant kills the shimmer for the cost of
 		 * ~25 ms of velocity lag under hard acceleration (partially covered
 		 * by the separately-exported acceleration term).
-		 * OHMD_RIFT_VEL_SMOOTH_MS overrides, 0 disables. */
+		 * OHMD_RIFT_VEL_SMOOTH_MS overrides tau, 0 disables.
+		 *
+		 * The smoothing is SPEED-ADAPTIVE, because a fixed tau pays that lag
+		 * all the time to solve a problem that only exists at rest. The noise
+		 * it suppresses is a roughly constant ~0.1 m/s; genuine head motion is
+		 * many times that, so once the device is really moving the average is
+		 * buying nothing and the lag is pure cost. Reported as "when I move
+		 * slowly it's fine, when I move quickly it lags behind" - which is the
+		 * signature exactly, since lag from a velocity EMA is proportional to
+		 * ACCELERATION and vanishes at constant speed.
+		 *
+		 * It bites hardest in rotation. Linear prediction is
+		 * p += v*dt + a*dt^2/2, so the separately-exported acceleration term
+		 * partly covers a stale velocity - but DriverPose_t carries no angular
+		 * acceleration (openvr_driver.h says as much) and we export none, so
+		 * orientation is predicted from omega alone and the lag is entirely
+		 * uncompensated. At a 40 ms photon horizon, ramping to 200 deg/s in
+		 * 150 ms is ~1.3 deg of view error, appearing only under fast motion
+		 * and overshooting on the way out of it.
+		 *
+		 * So: hold tau at rest, and shorten it in proportion to how fast the
+		 * device is actually going, past a deadband set above the noise floor
+		 * so the noise cannot unblank the filter it exists to suppress. Same
+		 * shape as the output-correction bleed above, which likewise runs
+		 * faster while the head is moving. OHMD_RIFT_VEL_ADAPTIVE=0 pins the
+		 * old fixed-tau behaviour for comparison. */
 		{
+			/* Rest noise to ignore, and the speed at which tau is halved. */
+			static const float LIN_FLOOR = 0.10f, LIN_REF = 0.25f;  /* m/s */
+			static const float ANG_FLOOR = 0.10f, ANG_REF = 0.50f;  /* rad/s */
 			static float tau_s = -1.0f;
+			static bool adaptive = true;
+
 			if (tau_s < 0.0f) {
 				const char *e = getenv("OHMD_RIFT_VEL_SMOOTH_MS");
 				float ms = e ? (float) atof(e) : 25.0f;
 				if (ms < 0.0f)
 					ms = 0.0f;
 				tau_s = ms / 1000.0f;
+
+				e = getenv("OHMD_RIFT_VEL_ADAPTIVE");
+				adaptive = !(e && atoi(e) == 0);
+				LOGI("velocity smoothing: tau %.0f ms, %s", tau_s * 1000.0f,
+				     adaptive ? "speed-adaptive" : "fixed");
 			}
 			if (tau_s > 0.0f) {
 				float sdt = 0.001f;
@@ -1366,16 +1401,33 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 						sdt = 0.1f;
 				}
 				dev->vel_filt_ts = dev->device_time_ns;
-				float alpha = sdt / (tau_s + sdt);
 				vec3f tmp;
 
+				/* Gate on the INCOMING magnitude, not the filtered one: it has
+				 * to react at the instant motion starts, which is precisely
+				 * when a stale velocity does the visible damage. */
+				float lin_tau = tau_s, ang_tau = tau_s;
+				if (adaptive) {
+					float ls = ovec3f_get_length(&dev->reported_lin_vel) - LIN_FLOOR;
+					float as = ovec3f_get_length(&dev->reported_ang_vel) - ANG_FLOOR;
+					if (ls < 0.0f)
+						ls = 0.0f;
+					if (as < 0.0f)
+						as = 0.0f;
+					lin_tau = tau_s / (1.0f + ls / LIN_REF);
+					ang_tau = tau_s / (1.0f + as / ANG_REF);
+				}
+
+				float lin_alpha = sdt / (lin_tau + sdt);
+				float ang_alpha = sdt / (ang_tau + sdt);
+
 				ovec3f_subtract(&dev->reported_lin_vel, &dev->vel_filt, &tmp);
-				ovec3f_multiply_scalar(&tmp, alpha, &tmp);
+				ovec3f_multiply_scalar(&tmp, lin_alpha, &tmp);
 				ovec3f_add(&dev->vel_filt, &tmp, &dev->vel_filt);
 				dev->reported_lin_vel = dev->vel_filt;
 
 				ovec3f_subtract(&dev->reported_ang_vel, &dev->ang_vel_filt, &tmp);
-				ovec3f_multiply_scalar(&tmp, alpha, &tmp);
+				ovec3f_multiply_scalar(&tmp, ang_alpha, &tmp);
 				ovec3f_add(&dev->ang_vel_filt, &tmp, &dev->ang_vel_filt);
 				dev->reported_ang_vel = dev->ang_vel_filt;
 			}
