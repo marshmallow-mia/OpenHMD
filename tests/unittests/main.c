@@ -67,6 +67,8 @@ int main()
 	Test(test_rift_cam_calib_rejects_outliers);
 	Test(test_rift_cam_calib_headset_move_is_not_a_camera_move);
 	Test(test_rift_cam_calib_history_spans_viewpoints);
+	Test(test_rift_cam_calib_decide_recovers_from_a_moved_camera);
+	Test(test_rift_cam_calib_decide_guards_and_gates);
 	printf("\n");
 
 	printf("sync monitor tests\n");

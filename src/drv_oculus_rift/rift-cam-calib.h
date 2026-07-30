@@ -123,6 +123,7 @@ typedef struct {
 	posef obj_cam_ref;    /* device pose in the reference camera's frame */
 	posef obj_cam_other;  /* the same exposure, in this camera's frame */
 	uint16_t bin;         /* viewpoint bucket, for stratified eviction */
+	uint32_t seq;         /* arrival order, so eviction can take the oldest */
 } rift_cam_calib_sample;
 
 typedef struct {
@@ -139,6 +140,8 @@ typedef struct {
 	uint16_t n_hist;
 	uint16_t bin_count[RIFT_CAM_CALIB_BINS];
 	uint16_t bins_seen;      /* distinct viewpoint buckets represented */
+
+	uint32_t seq;            /* monotonic sample counter for eviction order */
 
 	uint32_t n_seen;         /* co-observed exposures ever fed in */
 	uint32_t n_solves;
@@ -178,6 +181,30 @@ bool rift_cam_calib_camera_moved(const rift_cam_calib *c, const posef *rel);
 /* Throw away the accumulated history ("Invalid calibration: resetting
  * history"). */
 void rift_cam_calib_reset(rift_cam_calib *c);
+
+typedef enum {
+	RIFT_CAM_CALIB_WAIT = 0,  /* not enough history to say anything */
+	RIFT_CAM_CALIB_KEEP,      /* what is in use is fine, or better conditioned */
+	RIFT_CAM_CALIB_RESET,     /* the camera moved - drop history and recover */
+	RIFT_CAM_CALIB_ADOPT,     /* take the current estimate */
+} rift_cam_calib_action;
+
+/* What to do about the calibration currently in use. Pure: it changes nothing,
+ * so the whole policy can be tested without a tracker or hardware -- which is
+ * the point, because the livelock this exists to prevent hid inside the
+ * side-effecting version of it.
+ *
+ *   rel_in_use   what the sensor poses in use imply, or NULL if the sensor has
+ *                no pose yet (then there is nothing to weigh against)
+ *   adopted      whether this session has already adopted an estimate
+ *   recovering   set after a RESET, until the next ADOPT
+ *   stored_viewpoints  viewpoint count recorded with the stored calibration
+ *
+ * out_r_in_use / out_r_est receive the two residuals in pixels (-1 when not
+ * applicable); either may be NULL. */
+rift_cam_calib_action rift_cam_calib_decide(const rift_cam_calib *c,
+	const posef *rel_in_use, bool adopted, bool recovering,
+	int stored_viewpoints, float *out_r_in_use, float *out_r_est);
 
 /* Compose a camera's world pose from the reference camera's world pose and a
  * relative pose. */

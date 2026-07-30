@@ -126,13 +126,16 @@ static const float VIEWPOINTS[4][3] = {
  * by an amount that DEPENDS ON THE VIEWPOINT, which is exactly what makes a
  * single-viewpoint calibration overfit. Measured on real hardware at ~7 mm for
  * 28 cm of headset movement (windows-vs-linux-tracking.md §5b). */
-static void exposure_at(int v, int i, float bias_m, float noise_m,
-	posef *ocr, posef *oco)
+static void exposure_at_cams(int v, int i, float bias_m, float noise_m,
+	const posef *cam_other_in, posef *ocr, posef *oco)
 {
 	posef cam_ref, cam_other, obj, at;
 
 	pose_make(&cam_ref, 0.49f, 1.56f, -1.62f, 0.0f, 1.0f, 0.0f, 0.10f);
-	pose_make(&cam_other, -0.74f, 1.84f, -1.54f, 0.0f, 1.0f, 0.0f, -0.40f);
+	if (cam_other_in != NULL)
+		cam_other = *cam_other_in;
+	else
+		pose_make(&cam_other, -0.74f, 1.84f, -1.54f, 0.0f, 1.0f, 0.0f, -0.40f);
 
 	/* place the object so that, seen from cam_ref, it sits at VIEWPOINTS[v] */
 	pose_make(&at, VIEWPOINTS[v][0], VIEWPOINTS[v][1], VIEWPOINTS[v][2],
@@ -148,6 +151,12 @@ static void exposure_at(int v, int i, float bias_m, float noise_m,
 
 	perturb(ocr, i, noise_m, noise_m);
 	perturb(oco, i + 7, noise_m, noise_m);
+}
+
+static void exposure_at(int v, int i, float bias_m, float noise_m,
+	posef *ocr, posef *oco)
+{
+	exposure_at_cams(v, i, bias_m, noise_m, NULL, ocr, oco);
 }
 
 /* Averaging noise down must work, and settling must require the estimate to be
@@ -354,4 +363,157 @@ void test_rift_cam_calib_rejects_outliers()
 
 	rift_cam_calib_get(&c, &after);
 	TAssert(pose_pos_err(&before, &after) < 0.005f);
+}
+
+/* THE LIVELOCK REGRESSION.
+ *
+ * A sensor moved while the driver was NOT running is the case that bites. On
+ * the next start the history is built entirely from post-move observations and
+ * compared against the stored pre-move pose, so the move is correctly detected
+ * and the history dropped - but the history then rebuilds from post-move data
+ * again, is tested against the SAME stale pose, exceeds the threshold again,
+ * and resets again. Forever, at roughly one reset per MIN_SAMPLES exposures,
+ * with the sensor keeping its wrong pose throughout. Nothing else rescues it:
+ * the online extrinsic refiner needs RIFT_POSE_MATCH_STRONG, which is withheld
+ * from exactly the sensor whose extrinsics are wrong.
+ *
+ * (A sensor moved WHILE running does not hit this - the bounded history
+ * transitions gradually, so the improvement gate re-adopts along the way and
+ * the pose in use never diverges far enough to trigger a reset. That case is
+ * checked at the end.)
+ *
+ * This drives the real decision function and asserts it resets ONCE and then
+ * adopts, rather than resetting forever. */
+void test_rift_cam_calib_decide_recovers_from_a_moved_camera()
+{
+	rift_cam_calib c;
+	posef cam_ref, cam_before, cam_after, ocr, oco;
+	posef stale, rel_in_use, truth_after, got;
+	bool adopted = true, recovering = false;
+	int i, resets = 0, adopts = 0, consecutive_resets = 0;
+
+	pose_make(&cam_ref, 0.49f, 1.56f, -1.62f, 0.0f, 1.0f, 0.0f, 0.10f);
+	pose_make(&cam_before, -0.74f, 1.84f, -1.54f, 0.0f, 1.0f, 0.0f, -0.40f);
+	/* somebody moves it between sessions: 22 cm along and 6 deg round */
+	pose_make(&cam_after, -0.52f, 1.83f, -1.51f, 0.0f, 1.0f, 0.0f, -0.295f);
+
+	relative_truth(&cam_ref, &cam_before, &stale);   /* what the config says */
+	relative_truth(&cam_ref, &cam_after, &truth_after);
+	TAssert(pose_pos_err(&stale, &truth_after) > 0.15f);
+	rel_in_use = stale;
+
+	/* a fresh session: every observation is from after the move */
+	rift_cam_calib_init(&c);
+	for (i = 0; i < 900; i++) {
+		rift_cam_calib_action a;
+
+		exposure_at_cams(i % 3, i, 0.0f, 0.002f, &cam_after, &ocr, &oco);
+		rift_cam_calib_add(&c, &ocr, &oco);
+
+		a = rift_cam_calib_decide(&c, &rel_in_use, adopted, recovering, 3,
+			NULL, NULL);
+		if (a == RIFT_CAM_CALIB_RESET) {
+			resets++;
+			consecutive_resets++;
+			/* the bug: resetting over and over, never adopting */
+			TAssert(consecutive_resets < 2);
+			rift_cam_calib_reset(&c);
+			recovering = true;
+			adopted = false;
+		} else if (a == RIFT_CAM_CALIB_ADOPT) {
+			consecutive_resets = 0;
+			adopts++;
+			/* the caller moves the sensor to where the estimate says */
+			TAssert(rift_cam_calib_get(&c, &rel_in_use));
+			recovering = false;
+			adopted = true;
+		}
+	}
+
+	TAssert(resets >= 1);       /* the move was noticed... */
+	TAssert(adopts >= 1);       /* ...and recovered from */
+	TAssert(!recovering);       /* not left stuck mid-recovery */
+	TAssert(pose_pos_err(&rel_in_use, &stale) > 0.15f);  /* actually moved */
+
+	/* and it converged on where the camera actually is now */
+	TAssert(rift_cam_calib_get(&c, &got));
+	TAssert(pose_pos_err(&got, &truth_after) < 0.01f);
+	TAssert(pose_ang_err(&got, &truth_after) < 0.02f);
+
+	/* settled there, the pose in use must stop looking "moved" */
+	TAssert(rift_cam_calib_decide(&c, &rel_in_use, true, false, 3,
+		NULL, NULL) != RIFT_CAM_CALIB_RESET);
+
+	/* A sensor nudged only slightly - under the camera-moved threshold, which
+	 * is ~40 mm at this distance - is tracked by the improvement gate as the
+	 * bounded history turns over, without any reset at all. (A larger knock
+	 * while running does trip the threshold, and is handled by the same
+	 * recovery path exercised above.) */
+	{
+		posef cam_nudged;
+		int resets_running = 0;
+
+		pose_make(&cam_nudged, -0.505f, 1.83f, -1.50f, 0.0f, 1.0f, 0.0f, -0.288f);
+		for (i = 900; i < 2000; i++) {
+			rift_cam_calib_action a;
+
+			exposure_at_cams(i % 3, i, 0.0f, 0.002f, &cam_nudged, &ocr, &oco);
+			rift_cam_calib_add(&c, &ocr, &oco);
+			a = rift_cam_calib_decide(&c, &rel_in_use, true, false, 3,
+				NULL, NULL);
+			if (a == RIFT_CAM_CALIB_RESET)
+				resets_running++;
+			else if (a == RIFT_CAM_CALIB_ADOPT)
+				TAssert(rift_cam_calib_get(&c, &rel_in_use));
+		}
+		TAssert(resets_running == 0);
+
+		relative_truth(&cam_ref, &cam_nudged, &truth_after);
+		TAssert(rift_cam_calib_get(&c, &got));
+		TAssert(pose_pos_err(&got, &truth_after) < 0.01f);
+	}
+}
+
+/* The guards the recovery path deliberately skips must still hold normally. */
+void test_rift_cam_calib_decide_guards_and_gates()
+{
+	rift_cam_calib narrow;
+	posef ocr, oco, rel, truth, cam_ref, cam_other;
+	int i;
+
+	pose_make(&cam_ref, 0.49f, 1.56f, -1.62f, 0.0f, 1.0f, 0.0f, 0.10f);
+	pose_make(&cam_other, -0.74f, 1.84f, -1.54f, 0.0f, 1.0f, 0.0f, -0.40f);
+	relative_truth(&cam_ref, &cam_other, &truth);
+
+	/* nothing yet */
+	rift_cam_calib_init(&narrow);
+	TAssert(rift_cam_calib_decide(&narrow, &truth, false, false, 0,
+		NULL, NULL) == RIFT_CAM_CALIB_WAIT);
+
+	/* one viewpoint only */
+	for (i = 0; i < 200; i++) {
+		exposure_at(0, i, 0.007f, 0.002f, &ocr, &oco);
+		rift_cam_calib_add(&narrow, &ocr, &oco);
+	}
+	TAssert(narrow.bins_seen == 1);
+	rift_cam_calib_get(&narrow, &rel);
+
+	/* a sensor with no pose at all takes whatever there is */
+	TAssert(rift_cam_calib_decide(&narrow, NULL, false, false, 0,
+		NULL, NULL) == RIFT_CAM_CALIB_ADOPT);
+
+	/* a narrower session must not overwrite a better-conditioned stored fit */
+	TAssert(rift_cam_calib_decide(&narrow, &rel, false, false, 6,
+		NULL, NULL) == RIFT_CAM_CALIB_KEEP);
+	/* ...but may once its own coverage matches */
+	TAssert(rift_cam_calib_decide(&narrow, &rel, false, false, 1,
+		NULL, NULL) == RIFT_CAM_CALIB_ADOPT);
+
+	/* already adopted and nothing better on offer: leave it alone */
+	TAssert(rift_cam_calib_decide(&narrow, &rel, true, false, 0,
+		NULL, NULL) == RIFT_CAM_CALIB_KEEP);
+
+	/* and recovering short-circuits to adopt, whatever the stored count */
+	TAssert(rift_cam_calib_decide(&narrow, &rel, false, true, 99,
+		NULL, NULL) == RIFT_CAM_CALIB_ADOPT);
 }

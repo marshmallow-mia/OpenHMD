@@ -71,6 +71,8 @@ void test_rift_cam_calib_rejects_stale_stored_calibration();
 void test_rift_cam_calib_rejects_outliers();
 void test_rift_cam_calib_headset_move_is_not_a_camera_move();
 void test_rift_cam_calib_history_spans_viewpoints();
+void test_rift_cam_calib_decide_recovers_from_a_moved_camera();
+void test_rift_cam_calib_decide_guards_and_gates();
 
 // exposure/frame/pose timing monitor
 void test_rift_sync_monitor_clean_stream();
