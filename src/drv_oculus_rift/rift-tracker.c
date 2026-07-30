@@ -560,14 +560,30 @@ static void extrinsic_refine_measure(rift_tracked_device_priv *dev,
 	}
 }
 
-/* Set OHMD_RIFT_NO_BLEED=1 to disable output correction bleeding (for A/B
- * testing): optical corrections then step the displayed pose directly. */
+/* Optical corrections are applied to the displayed pose directly. They used to
+ * be bled in over OUT_CORR_TAU instead, to hide the step each one made, and
+ * that is now OFF by default -- set OHMD_RIFT_BLEED=1 to restore it.
+ *
+ * Bleeding was worth it when corrections were large and noisy. It is not any
+ * more: with the joint reconstruction and automatic calibration in place they
+ * are small and trustworthy, so smearing one over ~1 s only delays a correct
+ * measurement, and does so *while the head is moving* since the rate scales
+ * with velocity. Reported in the headset as movement that "translates weirdly"
+ * while never vibrating - which is exactly the shape of the trade.
+ *
+ * Measured, stationary, on the output pose: turning it off costs 0.023 -> 0.029
+ * mm of sample-to-sample step (max 0.17 -> 0.35 mm) and 0.184 -> 0.236 mm rms
+ * shake. All far below anything visible, against up to OUT_CORR_MAX_LIN = 5 cm
+ * of positional lag while moving. */
 static bool out_corr_enabled(void)
 {
 	static int enabled = -1;
 	if (enabled == -1) {
-		const char *e = getenv("OHMD_RIFT_NO_BLEED");
-		enabled = !(e && e[0] == '1');
+		const char *e = getenv("OHMD_RIFT_BLEED");
+		enabled = (e && e[0] == '1');
+		LOGI("output correction bleeding %s%s",
+			enabled ? "ON" : "OFF",
+			enabled ? " (OHMD_RIFT_BLEED=1)" : " - set OHMD_RIFT_BLEED=1 to restore");
 	}
 	return enabled;
 }
