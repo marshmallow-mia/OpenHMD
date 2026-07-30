@@ -14,10 +14,12 @@
  */
 #include <assert.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "rift-fusion-ovr.h"
+#include "../openhmdi.h"
 
 #define GRAVITY_MAG 9.8f
 
@@ -283,22 +285,122 @@ static bool vision_tilt_enabled(void)
 	return enabled;
 }
 
+/* The vision-correction gains are the SDK 0.3.2 constants, and that SDK got
+ * its yaw from a MAGNETOMETER - noisy, biased by nearby metal, worth trusting
+ * only slowly. Constellation vision is a different instrument entirely, and
+ * 0.25/s is a ~4 second time constant on an error that optics can measure to a
+ * fraction of a degree. Meanwhile position is corrected at 10/s, a ~0.1 s
+ * constant - so position snaps home while orientation crawls, which is what
+ * "it lags behind until it finds the right spot" describes.
+ *
+ * Before changing a constant on that reasoning, MEASURE it: the telemetry
+ * below reports how large the orientation error actually gets and, more to the
+ * point, how long it dwells above a degree before washing out. Override the
+ * gains with OHMD_RIFT_VISION_YAW_GAIN / OHMD_RIFT_VISION_TILT_GAIN to A/B. */
+static float env_gain(const char *name, float dflt)
+{
+	const char *e = getenv(name);
+	float v;
+
+	if (e == NULL)
+		return dflt;
+	v = (float) atof(e);
+	if (v < 0.0f)
+		v = 0.0f;
+	if (v > 100.0f)   /* beyond this it is a snap, not a gain */
+		v = 100.0f;
+	return v;
+}
+
+static float vision_yaw_gain(void)
+{
+	static float g = -1.0f;
+	if (g < 0.0f)
+		g = env_gain("OHMD_RIFT_VISION_YAW_GAIN", VISION_YAW_GAIN);
+	return g;
+}
+
+static float vision_tilt_gain(void)
+{
+	static float g = -1.0f;
+	if (g < 0.0f)
+		g = env_gain("OHMD_RIFT_VISION_TILT_GAIN", VISION_TILT_GAIN);
+	return g;
+}
+
+/* How big is the vision-vs-fusion orientation disagreement, and how long does
+ * it persist? Mean and max answer the first; `dwell` answers the second by
+ * timing each unbroken stretch above 1 deg, which is the quantity the wearer
+ * actually perceives as settling. */
+static void orient_error_telemetry(float yaw_deg, float tilt_deg, float dt,
+	bool snapped)
+{
+	static double t_acc, dwell, dwell_max, dwell_sum, yaw_sum, tilt_sum;
+	static float yaw_max, tilt_max;
+	static int n, dwell_n, snaps;
+
+	float worst = yaw_deg > tilt_deg ? yaw_deg : tilt_deg;
+
+	n++;
+	t_acc += dt;
+	yaw_sum += yaw_deg;
+	tilt_sum += tilt_deg;
+	if (yaw_deg > yaw_max)
+		yaw_max = yaw_deg;
+	if (tilt_deg > tilt_max)
+		tilt_max = tilt_deg;
+	if (snapped)
+		snaps++;
+
+	if (worst > 1.0f) {
+		dwell += dt;
+	} else if (dwell > 0.0) {
+		if (dwell > dwell_max)
+			dwell_max = dwell;
+		dwell_sum += dwell;
+		dwell_n++;
+		dwell = 0.0;
+	}
+
+	if (t_acc >= 10.0) {
+		LOGI("vision-vs-fusion orientation error over %.0f s: yaw mean %.2f "
+			"max %.2f deg, tilt mean %.2f max %.2f deg | above 1 deg for "
+			"%.0f%% of the time, %d episodes, mean %.0f ms worst %.0f ms | "
+			"%d snaps | gains yaw %.2f tilt %.2f /s",
+			t_acc, yaw_sum / n, yaw_max, tilt_sum / n, tilt_max,
+			100.0 * (dwell_sum + dwell) / t_acc, dwell_n,
+			dwell_n ? 1000.0 * dwell_sum / dwell_n : 0.0, 1000.0 * dwell_max,
+			snaps, vision_yaw_gain(), vision_tilt_gain());
+		t_acc = dwell_sum = yaw_sum = tilt_sum = 0.0;
+		dwell_max = 0.0;
+		yaw_max = tilt_max = 0.0f;
+		n = dwell_n = snaps = 0;
+	}
+}
+
 /* OVR_SensorFusion.cpp applyVisionYawCorrection(), extended with tilt */
 static void apply_vision_yaw_correction(rift_fusion_ovr *f, float dt)
 {
 	quatf yaw_error, correction;
+	float yaw_deg, tilt_deg = 0.0f;
+	bool snapped = false;
 
 	extract_yaw_rotation(&f->vision_error.orient, &yaw_error);
+	yaw_deg = quat_angle(&yaw_error) * 180.0f / (float) M_PI;
 
-	if (quat_angle(&yaw_error) > VISION_YAW_SNAP_THRESHOLD)
+	if (quat_angle(&yaw_error) > VISION_YAW_SNAP_THRESHOLD) {
 		correction = yaw_error; /* high error: jump to the vision pose */
-	else
-		quat_scale_rotation(&yaw_error, VISION_YAW_GAIN * dt, &correction);
+		snapped = true;
+	} else {
+		quat_scale_rotation(&yaw_error, vision_yaw_gain() * dt, &correction);
+	}
 
 	apply_orient_correction(f, &correction);
 
-	if (!vision_tilt_enabled())
+	if (!vision_tilt_enabled()) {
+		orient_error_telemetry(yaw_deg, 0.0f, dt, snapped);
 		return;
+	}
 
 	/* apply_orient_correction() updated vision_error: what remains is the
 	 * unapplied yaw fraction plus the tilt. Strip the yaw again and treat
@@ -309,12 +411,18 @@ static void apply_vision_yaw_correction(rift_fusion_ovr *f, float dt)
 	oquatf_mult(&f->vision_error.orient, &yaw_rem, &tilt_error);
 	oquatf_normalize_me(&tilt_error);
 
-	if (quat_angle(&tilt_error) > VISION_TILT_SNAP_THRESHOLD)
+	tilt_deg = quat_angle(&tilt_error) * 180.0f / (float) M_PI;
+
+	if (quat_angle(&tilt_error) > VISION_TILT_SNAP_THRESHOLD) {
 		tilt_corr = tilt_error;
-	else
-		quat_scale_rotation(&tilt_error, VISION_TILT_GAIN * dt, &tilt_corr);
+		snapped = true;
+	} else {
+		quat_scale_rotation(&tilt_error, vision_tilt_gain() * dt, &tilt_corr);
+	}
 
 	apply_orient_correction(f, &tilt_corr);
+
+	orient_error_telemetry(yaw_deg, tilt_deg, dt, snapped);
 }
 
 /* OVR_SensorFusion.cpp applyPositionCorrection() */
