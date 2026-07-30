@@ -1544,9 +1544,16 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 			 * of the hardware slider - and not the lens centre separation.
 			 * Nothing was reading it, because ipd stayed at the universal
 			 * 0.061 default from ohmd_set_default_device_properties(), so
-			 * every CV1 rendered its stereo pair at 61 mm wherever the slider
-			 * actually was. This one reports 63.5 mm; the slider spans about
-			 * 58-72 mm, so the error reaches ~11 mm at the ends.
+			 * every CV1 rendered its stereo pair at 61 mm regardless. This
+			 * one reports 63.5 mm.
+			 *
+			 * CAVEAT, measured: the value does NOT track the hardware slider -
+			 * moving it and re-opening the device still reports 63.5 mm. So
+			 * this is the headset's own stored figure, not the live slider
+			 * position, and it is an improvement on a universal default rather
+			 * than a true per-user IPD. Reading the real slider needs a
+			 * different report than DISPLAY_INFO; the Oculus runtime does
+			 * display it live, so one exists.
 			 *
 			 * A stereo baseline that disagrees with the wearer's eyes puts
 			 * every disparity slightly wrong - the world sits at the wrong
@@ -1556,7 +1563,8 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 			if (priv->display_info.lens_separation > 0.050f &&
 			    priv->display_info.lens_separation < 0.085f) {
 				hmd_dev->base.properties.ipd = priv->display_info.lens_separation;
-				LOGI("HMD IPD %.1f mm, from the headset's own slider position",
+				LOGI("HMD IPD %.1f mm, as reported by the headset (note: this "
+					"is its stored figure, not the live slider position)",
 					priv->display_info.lens_separation * 1000.0f);
 			} else {
 				LOGW("HMD reported an implausible IPD of %.4f m - keeping the "
