@@ -21,6 +21,14 @@ typedef struct rift_pose_finder rift_pose_finder;
  * undistorted normalised rays, so the tracker can reconstruct one pose from
  * every sensor that saw the device instead of averaging their separate
  * solutions. NULL if the correspondence set could not be built. */
+/* Minimum LED correspondences for an observation to feed automatic camera
+ * calibration. Higher than the joint solver's own minimum on purpose:
+ * calibration needs each camera's INDEPENDENT 6-DoF solve to be well
+ * conditioned, not merely good enough to track from. A handful of LEDs
+ * clustered on one side of the visor pins orientation far better than depth,
+ * and that error would go straight into the relative pose. */
+#define RIFT_CALIB_MIN_BLOBS 10
+
 typedef bool (*rift_pose_finder_cb) (void *cb_data,
 	rift_tracked_device *dev, rift_sensor_analysis_frame *frame,
 	posef *obj_world_pose, rift_pose_metrics *score,
@@ -47,6 +55,12 @@ struct rift_pose_finder {
 
 	/* Brute force search */
 	correspondence_search_t *cs;
+
+	/* Calibration feed accounting, so a gate that silently disables the whole
+	 * calibration subsystem is visible in the log instead of looking exactly
+	 * like a healthy converged one. */
+	uint32_t calib_offered, calib_passed;
+	uint32_t calib_rej_ids, calib_rej_blobs, calib_rej_error;
 
 	rift_pose_finder_cb pose_cb;
 	rift_pose_finder_calib_cb calib_cb;

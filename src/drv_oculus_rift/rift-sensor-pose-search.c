@@ -589,8 +589,13 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 		pf->sensor_id, POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_STRONG) ? "strong" : "good",
 		score->matched_blobs, score->visible_leds, score->match_flags);
 
-	/* Arbitrary 25 degree threshold for gravity vector matches the minimum error */
-	if (!pf->have_camera_pose && dev->id == 0 && dev_state->gravity_error_rad <= DEG_TO_RAD(25.0)) {
+	/* The tracker floors every reported rot_error component at MIN_ROT_ERROR,
+	 * which is also 25 deg - so testing "<= 25 deg" here could only ever pass
+	 * by exact float equality with that floor, and any real value above it
+	 * failed. Gate above the floor instead: at or near it means the fusion is
+	 * as confident about tilt as it is able to report, which is what this
+	 * actually wants to know. */
+	if (!pf->have_camera_pose && dev->id == 0 && dev_state->gravity_error_rad <= DEG_TO_RAD(26.0)) {
 		/* No camera pose yet. If this is the HMD, we had an IMU pose at capture time,
 		 * and the fusion has a good gravity vector from the IMU, use it to
 		 * initialise the camera (world->camera) pose using the current headset pose.
@@ -651,11 +656,44 @@ update_device_and_blobs (rift_pose_finder *pf, rift_sensor_analysis_frame *frame
 	 * LED-ID verification and reprojection error are properties of this
 	 * camera's own image and cannot be poisoned by a bad camera pose, so
 	 * they are what the gate is built from. */
-	if (pf->calib_cb != NULL &&
-	    POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS) &&
-	    score->matched_blobs >= 10 &&
-	    score->reprojection_error / score->matched_blobs < 1.5)
-		pf->calib_cb(pf->pose_cb_data, dev, frame, &pose);
+	if (pf->calib_cb != NULL) {
+		/* Every rejection is counted and reported, because this gate has
+		 * twice brought the entire calibration subsystem to a silent halt and
+		 * both times it looked identical to a healthy converged one - no
+		 * history, no solve, no camera-moved detection, no output of any
+		 * kind, while the joint reconstruction sat at 52 px complaining about
+		 * the very extrinsics calibration existed to fix.
+		 *
+		 * Once from RIFT_POSE_MATCH_STRONG, which is withheld from exactly
+		 * the sensors that need calibrating. Once from the blob floor, with
+		 * the headset turned away so only 9 LEDs were visible at all. The
+		 * first was a real bug; the second was the gate doing its job on
+		 * unusable data. Telling those apart from the outside is impossible
+		 * without these counters, which is the point of them. */
+		bool ids = POSE_HAS_FLAGS(score, RIFT_POSE_MATCH_LED_IDS);
+		bool enough = score->matched_blobs >= RIFT_CALIB_MIN_BLOBS;
+		bool clean = score->reprojection_error / score->matched_blobs < 1.5;
+
+		pf->calib_offered++;
+		if (ids && enough && clean) {
+			pf->calib_passed++;
+			pf->calib_cb(pf->pose_cb_data, dev, frame, &pose);
+		} else if (!ids) {
+			pf->calib_rej_ids++;
+		} else if (!enough) {
+			pf->calib_rej_blobs++;
+		} else {
+			pf->calib_rej_error++;
+		}
+
+		if ((pf->calib_offered % 900) == 1 && pf->calib_offered > 1) {
+			LOGI("sensor %d calibration feed: %u offered, %u passed - rejected "
+				"%u for LED ids, %u for too few blobs (<%d), %u for error",
+				pf->sensor_id, pf->calib_offered, pf->calib_passed,
+				pf->calib_rej_ids, pf->calib_rej_blobs, RIFT_CALIB_MIN_BLOBS,
+				pf->calib_rej_error);
+		}
+	}
 
 	if (!pf->have_camera_pose) {
 		LOGD("Sensor %d No camera pose yet - gravity error is %f degrees rot_error (%f, %f, %f). Not fusing pose for device %d",
