@@ -283,6 +283,7 @@ struct rift_tracker_ctx_s
 	 * once the rebuilt estimate has been adopted */
 	bool cam_calib_recovering[RIFT_MAX_SENSORS];
 	uint32_t cam_calib_pairs;
+	uint32_t cam_calib_obs;   /* observations that reached the feed at all */
 
 	ohmd_thread* usb_thread;
 	int usb_completed;
@@ -2213,6 +2214,17 @@ void rift_tracker_add_calib_obs(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor,
 	rift_calib_exposure *e = NULL;
 	int idx, i;
 
+	/* Counted before any early return, so a feed that never starts is
+	 * distinguishable from one that starts and stalls - the two look identical
+	 * from the outside, both being silent. */
+	ctx->cam_calib_obs++;
+	if ((ctx->cam_calib_obs % 900) == 1) {
+		LOGI("calib feed: %u observations offered (auto_calib %d, sensors %u, "
+			"exposure_info %s, device %d)",
+			ctx->cam_calib_obs, auto_calib_enabled() ? 1 : 0, ctx->n_sensors,
+			exposure_info ? "yes" : "NULL", dev->id);
+	}
+
 	if (!auto_calib_enabled() || ctx->n_sensors < 2 || exposure_info == NULL)
 		return;
 	/* Only the HMD: its constellation is dense enough that a single-frame
@@ -2254,6 +2266,23 @@ void rift_tracker_add_calib_obs(rift_tracker_ctx *ctx, rift_sensor_ctx *sensor,
 				rift_cam_calib_add(ctx->cam_calib + i, e->obj_cam + 0, e->obj_cam + i);
 				ctx->cam_calib_pairs++;
 			}
+		}
+	}
+
+	/* Periodic visibility into the calibration feed. Without it a silent
+	 * pairing failure is indistinguishable from a healthy converged one -
+	 * both simply produce no output. */
+	if ((ctx->cam_calib_obs % 900) == 1) {
+		int si;
+		for (si = 1; si < ctx->n_sensors; si++) {
+			rift_cam_calib *cc = ctx->cam_calib + si;
+			LOGI("calib feed %s: %u obs, %u paired, history %u over %u viewpoints, "
+				"%u solves, residual %.2f px, %s",
+				rift_sensor_serial_no(ctx->sensors[si]), ctx->cam_calib_obs,
+				ctx->cam_calib_pairs, cc->n_hist, cc->bins_seen, cc->n_solves,
+				cc->residual_px,
+				cc->state == RIFT_CAM_CALIBRATED ? "CALIBRATED" :
+				cc->state == RIFT_CAM_ESTIMATED ? "estimated" : "uncalibrated");
 		}
 	}
 

@@ -512,8 +512,28 @@ static void error_estimates(rift_fusion_ovr *f, uint64_t time,
 		ovec3f_set(pos_error, p, p, p);
 	}
 	if (rot_error) {
-		float r = 0.02f + 0.05f * age;
-		ovec3f_set(rot_error, r, r, r);
+		/* Tilt and yaw are not observed by the same thing, and reporting one
+		 * number for both deadlocks cold start.
+		 *
+		 * X and Z are tilt, which gravity pins from the accelerometer with or
+		 * without vision - this filter's entire premise, per the header. Y is
+		 * yaw, which only vision pins, so only Y should grow with vision age.
+		 *
+		 * All three used to grow together, so a fusion that had never had a
+		 * vision fix reported 0.02 + 0.05*10 = 0.52 rad = 29.8 deg on every
+		 * axis, permanently. The camera-pose bootstrap gates on
+		 * max(x, z) <= 25 deg and vision cannot begin until some camera has a
+		 * pose, so from a cold start with no stored room config the first
+		 * camera could never be placed: the system sat with a converged
+		 * relative calibration (0.36 px over 3192 paired observations) and
+		 * nowhere to put it.
+		 *
+		 * Tilt confidence now comes from the gravity estimate that actually
+		 * determines it - wide until the ~1 s warm-up completes, tight after. */
+		float tilt = 0.52f;
+		if (f->grav_init)
+			tilt = 0.52f - (0.52f - 0.03f) * f->grav_warmup;
+		ovec3f_set(rot_error, tilt, 0.02f + 0.05f * age, tilt);
 	}
 }
 
