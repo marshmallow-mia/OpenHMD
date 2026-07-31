@@ -89,20 +89,42 @@ void exp_filter_pose_set_params(exp_filter_pose *f, double fc_min, double beta, 
 	exp_filter3d_set_params(&f->orient_filter, fc_min, beta, fc_min_d);
 }
 
+/* An exponential map is not unique: a rotation of angle t about n is equally
+ * t*n or (t - 2*pi)*n, the latter pointing the opposite way. At half a turn the
+ * two are equidistant, so the representation flips there - and smoothing across
+ * that flip averages two vectors that point in opposite directions, producing a
+ * rotation that is neither. Measured with tools/fusion_replay.c on a 400 deg/s
+ * turn ending at 180 deg: 36 of 4301 output samples wrong by more than 5 deg,
+ * worst 149.50 deg, against 0.138 deg with this filter bypassed. Confined to
+ * 180 deg; every other final orientation was clean.
+ *
+ * The previous attempt could not work. It tested `delta_mag`, which is a vector
+ * LENGTH and so never negative, making the `< -M_PI` branch dead code; and it
+ * rescaled prev_map along ITS OWN direction, which is only meaningful when the
+ * two are near-parallel - at the crossing they are near-antiparallel, which is
+ * the entire problem.
+ *
+ * Instead, just pick whichever of the two equivalent representations of the
+ * previous sample actually lies closer to the current one. Same rotation,
+ * continuous input, nothing to average across. */
 static void
 adjust_exp_map_proximity(vec3f *prev_map, vec3f *cur_map)
 {
-	vec3f delta;
+	vec3f alt, d_now, d_alt;
+	float mag = ovec3f_get_length(prev_map);
 
-	ovec3f_subtract(prev_map, cur_map, &delta);
-	float delta_mag = ovec3f_get_length(&delta);
+	if (mag < 1e-6f)
+		return;
 
-	if (delta_mag < -M_PI || delta_mag > M_PI) {
-		float prev_map_mag = ovec3f_get_length(prev_map);
-		int n_pi_region = ceil(delta_mag / (2*M_PI));
+	/* the same rotation, taken the other way round the circle:
+	 * mag*n - 2*pi*n = (mag - 2*pi)*n */
+	ovec3f_multiply_scalar(prev_map, 1.0f - (float)(2.0 * M_PI) / mag, &alt);
 
-		ovec3f_multiply_scalar(prev_map, 1 - (n_pi_region * 2 * M_PI) / prev_map_mag, prev_map);
-	}
+	ovec3f_subtract(prev_map, cur_map, &d_now);
+	ovec3f_subtract(&alt, cur_map, &d_alt);
+
+	if (ovec3f_get_length(&d_alt) < ovec3f_get_length(&d_now))
+		*prev_map = alt;
 }
 
 void exp_filter_pose_run(exp_filter_pose *f, uint64_t ts, const posef *in_pose, posef *out_pose)
