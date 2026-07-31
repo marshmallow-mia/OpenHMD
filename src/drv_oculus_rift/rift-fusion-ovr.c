@@ -467,6 +467,47 @@ void rift_fusion_ovr_imu_update(rift_fusion_ovr *f, uint64_t time,
 	bool vision_recent = f->have_vision_error &&
 		(time - f->last_vision_ns) < VISION_RECENT_NS;
 
+	/* Freezing the position when vision goes quiet is worse than coasting on
+	 * the IMU, and measurably so.
+	 *
+	 * The old rule integrated position only while a fix was newer than
+	 * VISION_RECENT_NS (70 ms) and otherwise zeroed lin_vel outright. Vision
+	 * drops out exactly when the head is moving fast - motion blur costs
+	 * blobs and the pose search needs ten matched LEDs - so the head travels
+	 * on while the estimate stands still. Measured in tools/fusion_replay.c
+	 * at 1.2 m/s with a 200 ms outage: the estimate froze 59 mm behind.
+	 *
+	 * That error is then read as evidence of motion. apply_position_correction
+	 * feeds it into GAIN_VEL (50/s) and GAIN_ACCEL (25/s) as well as position,
+	 * so the estimator concludes it must be moving fast, overshoots 26 mm PAST
+	 * the truth and rings for ~2 s, exporting 0.216 m/s while the head is
+	 * completely still - which SteamVR then multiplies by its prediction
+	 * horizon. That is the reported "the image takes a bit to stop moving".
+	 *
+	 * Coasting costs far less than freezing. Double-integrating accelerometer
+	 * bias is what the 70 ms gate was guarding against, but over a 300 ms gap
+	 * a 0.05 m/s^2 residual bias contributes ~2 mm - against the 59 mm the
+	 * freeze cost at 200 ms. Beyond the reacquire horizon the fix snaps
+	 * anyway, so coast to there and no further. Measured post-stop travel at
+	 * 1.2 m/s, old gate vs coasting: 200 ms outage 59.32 -> 3.63 mm, 300 ms
+	 * 178.43 -> 1.02 mm, 500 ms 424.16 -> 22.69 mm, and no change at all
+	 * without an outage (2.40 mm both ways). A longer window than the
+	 * reacquire horizon helps only the rare >700 ms case and costs a little
+	 * at 500 ms, so it is not the default.
+	 *
+	 * OHMD_RIFT_DEADRECKON_MS overrides the window in ms. Set it to 70 to
+	 * reproduce the old VISION_RECENT_NS-gated behaviour; 0 stops position
+	 * integrating at all, which is a diagnostic, not the old default. */
+	static int deadreckon_ms = -1;
+	if (deadreckon_ms < 0) {
+		const char *e = getenv("OHMD_RIFT_DEADRECKON_MS");
+		deadreckon_ms = e ? atoi(e) : (int)(VISION_REACQUIRE_NS / 1000000ULL);
+		if (deadreckon_ms < 0)
+			deadreckon_ms = 0;
+	}
+	bool integrate_position = f->have_vision_error &&
+		(time - f->last_vision_ns) < (uint64_t)deadreckon_ms * 1000000ULL;
+
 	/* StoreAndIntegrateGyro: Q = Q * quat(w, |w| dt) (body frame) */
 	quatf delta_q = {{ 0, 0, 0, 1 }};
 	float angle = ovec3f_get_length(ang_vel) * dt;
@@ -485,9 +526,10 @@ void rift_fusion_ovr_imu_update(rift_fusion_ovr *f, uint64_t time,
 	accel_world.y -= GRAVITY_MAG;
 	f->lin_accel = accel_world;
 
-	/* StoreAndIntegrateAccelerometer — position only rides the IMU while
-	 * vision is recent; otherwise hold position and zero velocity */
-	if (vision_recent) {
+	/* StoreAndIntegrateAccelerometer — position coasts on the IMU through a
+	 * vision gap (see integrate_position above); only past that does it hold
+	 * position and zero velocity */
+	if (integrate_position) {
 		vec3f a, v_step, a_step;
 		ovec3f_add(&accel_world, &f->accel_offset, &a);
 		v_step = f->lin_vel;
