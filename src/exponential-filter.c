@@ -60,7 +60,20 @@ void exp_filter3d_run(exp_filter3d *f, uint64_t ts, const vec3f *in_y, vec3f *ou
 	dt = (double)(ts - f->prev_ts) / 1000000000.0;
 	f->prev_ts = ts;
 
+	/* One Euro drives its cutoff from the SPEED of the signal, so this has to
+	 * be a derivative, not a raw difference: dy/dt, not dy. Without the
+	 * division the term scales with the sample interval, and at the ~900 Hz
+	 * this runs at (dt ~ 0.0011 s) it comes out roughly 900x too small. That
+	 * left fc_cutoff = fc_min + beta*|dy| pinned at fc_min for all realistic
+	 * motion - the adaptation was dead and the filter was a fixed 30 Hz
+	 * low-pass, i.e. constant lag whether the head was still or moving.
+	 *
+	 * Fixing it restores the intended behaviour at both ends: at rest dy is
+	 * ~0 so the cutoff stays at fc_min and the smoothing is unchanged, while
+	 * during motion the cutoff rises and the filter gets out of the way. */
 	ovec3f_subtract(in_y, &f->prev_y, &dy);
+	for (int i = 0; i < 3; i++)
+		dy.arr[i] /= (float)dt;
 	alpha_d = calc_smoothing_alpha(f->fc_min_d, dt);
 
 	/* Smooth the dy values and use them to calculate the frequency cutoff for the main filter */
