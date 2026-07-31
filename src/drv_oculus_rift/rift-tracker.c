@@ -1473,6 +1473,50 @@ uint64_t rift_tracked_device_get_pose_age_ns(rift_tracked_device *dev_base, uint
 	ohmd_lock_mutex (dev->device_lock);
 	if (dev->last_imu_local_ts != 0 && now_local_ts > dev->last_imu_local_ts)
 		age = now_local_ts - dev->last_imu_local_ts;
+
+	/* This age IS the prediction horizon: SteamVR extrapolates from here to
+	 * photon time, so every millisecond of it multiplies whatever error is in
+	 * the exported velocity. Over-predicting looks like the image continuing
+	 * to move after the head has stopped - and costs nothing at rest, where
+	 * the velocities are zero. So report the horizon and the speeds it gets
+	 * multiplied by, which together bound how far the displayed pose can be
+	 * thrown past the measured one. */
+	if (dev->base.id == 0) {
+		static uint64_t n, age_sum, age_max, last_report;
+		static double speed_sum, speed_max, ang_sum, ang_max, throw_max;
+		float speed = ovec3f_get_length(&dev->reported_lin_vel);
+		float ang = ovec3f_get_length(&dev->reported_ang_vel);
+		double age_s = age * 1e-9;
+		double thrown = speed * age_s;
+
+		n++;
+		age_sum += age;
+		if (age > age_max)
+			age_max = age;
+		speed_sum += speed;
+		if (speed > speed_max)
+			speed_max = speed;
+		ang_sum += ang;
+		if (ang > ang_max)
+			ang_max = ang;
+		if (thrown > throw_max)
+			throw_max = thrown;
+
+		if (last_report == 0)
+			last_report = now_local_ts;
+		if (now_local_ts - last_report > 10000000000ULL) {
+			LOGI("pose export over 10 s: age mean %.1f ms max %.1f ms | speed "
+				"mean %.2f max %.2f m/s, ang mean %.0f max %.0f deg/s | "
+				"age*speed worst %.1f mm (%"PRIu64" samples)",
+				1e-6 * age_sum / n, 1e-6 * age_max,
+				speed_sum / n, speed_max,
+				ang_sum / n * 180.0 / M_PI, ang_max * 180.0 / M_PI,
+				1000.0 * throw_max, n);
+			n = age_sum = age_max = 0;
+			speed_sum = speed_max = ang_sum = ang_max = throw_max = 0.0;
+			last_report = now_local_ts;
+		}
+	}
 	ohmd_unlock_mutex (dev->device_lock);
 
 	return age;
