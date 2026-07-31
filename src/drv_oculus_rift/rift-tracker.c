@@ -1326,6 +1326,8 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		if (angvel_world == -1) {
 			const char *e = getenv("OHMD_RIFT_ANGVEL_FRAME");
 			angvel_world = (e && strcmp(e, "world") == 0);
+			LOGI("angular velocity exported in the %s frame",
+			     angvel_world ? "world" : "device-local");
 		}
 		if (angvel_world) {
 			oquatf_get_rotated(&imu_global_pose.orient, &imu_ang_vel, &dev->reported_ang_vel);
@@ -1359,14 +1361,19 @@ void rift_tracked_device_get_view_pose(rift_tracked_device *dev_base, posef *pos
 		 * signature exactly, since lag from a velocity EMA is proportional to
 		 * ACCELERATION and vanishes at constant speed.
 		 *
-		 * It bites hardest in rotation. Linear prediction is
+		 * It bites harder in rotation. Linear prediction is
 		 * p += v*dt + a*dt^2/2, so the separately-exported acceleration term
-		 * partly covers a stale velocity - but DriverPose_t carries no angular
-		 * acceleration (openvr_driver.h says as much) and we export none, so
-		 * orientation is predicted from omega alone and the lag is entirely
+		 * partly covers a stale velocity. DriverPose_t does have a
+		 * vecAngularAcceleration field, but we export nothing into it, so
+		 * orientation is predicted from omega alone and the lag there is
 		 * uncompensated. At a 40 ms photon horizon, ramping to 200 deg/s in
 		 * 150 ms is ~1.3 deg of view error, appearing only under fast motion
 		 * and overshooting on the way out of it.
+		 *
+		 * Measured on this rig, this is NOT the cause of the reported
+		 * "movement feels wrong": disabling the smoothing outright changed
+		 * nothing perceptible. Kept because the lag is real and the fix is
+		 * free, not because it fixed the complaint.
 		 *
 		 * So: hold tau at rest, and shorten it in proportion to how fast the
 		 * device is actually going, past a deadband set above the noise floor
