@@ -301,15 +301,36 @@ struct rift_tracker_ctx_s
 	uint8_t n_devices;
 };
 
-/* Fusion backend selection: default is the OVR-SDK-style complementary
- * filter ported from Oculus SDK 0.3.2 (rift-fusion-ovr.c). Set
- * OHMD_RIFT_FUSION=ukf to use the original UKF instead. */
+/* Fusion backend selection. Default is the UKF (rift-kalman-6dof.c);
+ * OHMD_RIFT_FUSION=ovr selects the OVR-SDK-style complementary filter ported
+ * from Oculus SDK 0.3.2 (rift-fusion-ovr.c).
+ *
+ * The default was the OVR filter from the commit that introduced it (b665454)
+ * until 2026-07-31, and it is why the headset "overshoots and settles" after
+ * every movement. Bisected against pristine upstream: the artifact is absent at
+ * b665454^ and present from b665454 on, and switching this one selector at
+ * current HEAD removes it while leaving everything else in place.
+ *
+ * The mechanism is visible in the gains. rift-fusion-ovr.c applies
+ * corr_{pos,vel,accel} = err * GAIN * dt, a third-order observer with
+ * characteristic polynomial s^3 + Kp s^2 + Kv s + Ka. With the shipped
+ * GAIN_POS/GAIN_VEL/GAIN_ACCEL that factors into a well-damped pair at ~1 Hz
+ * AND a real pole at -0.559, i.e. a mode with a 1.8 s time constant. Ka is low
+ * relative to Kp and Kv (placing all three poles together at Kp=10 wants
+ * Kv=33.3, Ka=36.9 against the shipped 50/25), and that is what strands the
+ * slow root. The UKF has no such observer.
+ *
+ * This is a default change, not a deletion: the OVR filter was ported for
+ * reasons that still stand, and which of the two is better on latency, rest
+ * jitter and dropout recovery is NOT yet measured - only the overshoot is.
+ * Score both with tools/settle_profile.py in the rift-cv1-center repo against
+ * the Oculus runtime's 14.21 mm / tau 0.85 s before treating this as settled. */
 static bool use_ovr_fusion(void)
 {
 	static int use = -1;
 	if (use == -1) {
 		const char *e = getenv("OHMD_RIFT_FUSION");
-		use = !(e && strcmp(e, "ukf") == 0);
+		use = (e && strcmp(e, "ovr") == 0);
 	}
 	return use;
 }
