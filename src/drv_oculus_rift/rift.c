@@ -420,6 +420,58 @@ static void handle_tracker_sensor_msg(rift_hmd_t* priv, uint64_t local_ts, unsig
 				accel = raw_accel;
 		}
 
+		/* Is the accelerometer actually scaled correctly?
+		 *
+		 * Nothing has ever checked. We SET RIFT_SCF_USE_CALIBRATION, which
+		 * makes the branch above take the pass-through path - so the driver
+		 * applies no calibration of its own and trusts the headset to have
+		 * done it. The Oculus runtime does the opposite: its SENSOR_CONFIG
+		 * write in captures/win/2026-07-12/setup_hid.pcap carries flags 0x20,
+		 * i.e. USE_CALIBRATION clear, and it calibrates in software.
+		 *
+		 * That matters because at rest the accelerometer measures gravity and
+		 * nothing else, so |accel| MUST read 9.807. The fusion subtracts
+		 * GRAVITY_MAG flat; any scale error survives as a phantom acceleration
+		 * that is always present, which the estimator then has to fight. The
+		 * same raw stream decoded from their capture reads 9.4582 - 3.55% low
+		 * - and in tools/fusion_replay.c a 3.5% error triples the overshoot
+		 * after a move and quadruples the drift after it stops.
+		 *
+		 * So report the magnitude over quiet stretches. 9.807 means the
+		 * headset's internal calibration works and this is a dead end; 9.46
+		 * means we are integrating a 3.5%-wrong accelerometer. */
+		{
+			static double mag_sum = 0.0, worst_lo = 99.0, worst_hi = 0.0;
+			static uint64_t n_quiet = 0, last_report_ts = 0;
+
+			float gmag = ovec3f_get_length(&gyro);
+			if (gmag < 0.05f) {          /* stationary enough for g to dominate */
+				double m = ovec3f_get_length(&accel);
+				mag_sum += m;
+				n_quiet++;
+				if (m < worst_lo)
+					worst_lo = m;
+				if (m > worst_hi)
+					worst_hi = m;
+			}
+			if (last_report_ts == 0)
+				last_report_ts = local_ts;
+			if (local_ts - last_report_ts > 10000000000ULL) {
+				if (n_quiet > 200) {
+					double mean = mag_sum / n_quiet;
+					LOGI("accelerometer scale check: |accel| at rest mean %.4f "
+						"m/s^2 (%.2f%% vs 9.8067), range %.3f..%.3f, %llu "
+						"quiet samples | hw calibration %s",
+						mean, (mean / 9.8067 - 1.0) * 100.0, worst_lo, worst_hi,
+						(unsigned long long) n_quiet,
+						(priv->sensor_config.flags & RIFT_SCF_USE_CALIBRATION)
+							? "requested" : "NOT requested (driver applies its own)");
+				}
+				mag_sum = 0.0; n_quiet = 0; worst_lo = 99.0; worst_hi = 0.0;
+				last_report_ts = local_ts;
+			}
+		}
+
 		rift_tracked_device_imu_update(priv->tracked_dev, local_ts, device_ts, TICK_US_TO_SEC(dt), &gyro, &accel, &raw_mag,
 			hmd_sample_saturation(priv, s->samples[i].accel, s->samples[i].gyro));
 
