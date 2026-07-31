@@ -33,9 +33,75 @@
 #define ACCEL_FILTER_GAIN 2.5f                  /* SensorFilterBodyFrame */
 #define GRAV_STAT_TAU 1.0f                      /* ~1000-sample window */
 
-static const vec3f GAIN_POS = {{ 10, 10, 8 }};
-static const vec3f GAIN_VEL = {{ 50, 50, 32 }};
-static const vec3f GAIN_ACCEL = {{ 25, 25, 16 }};
+/* The position observer. corr_{pos,vel,accel} = err * GAIN * dt makes this a
+ * third-order observer with characteristic polynomial s^3 + Kp s^2 + Kv s + Ka,
+ * so the gains ARE the closed-loop poles and can be read straight off:
+ *
+ *   shipped X,Y  10 / 50 / 25  -> -4.72 +/- 4.74j (1.06 Hz, zeta 0.71)
+ *                                 AND a real pole at -0.559, tau = 1.79 s
+ *   shipped Z     8 / 32 / 16  -> -3.71 +/- 3.73j  AND -0.577, tau = 1.73 s
+ *
+ * That stranded slow root is the "move, overshoot, settle" the wearer reports;
+ * bisecting to the commit that made this filter the default is what found it.
+ * Ka is too low relative to Kp and Kv: placing all three poles together needs
+ * Kp = 3w, Kv = 3w^2, Ka = w^3, so at Kp = 10 that is Kv = 33.3, Ka = 36.9 and
+ * every mode gets tau = 0.30 s.
+ *
+ * Switching to the UKF removes the overshoot but is perceptibly laggier, so the
+ * point of tuning here is to keep this filter's responsiveness without the slow
+ * mode. Overridable so that can be swept offline against tools/fusion_replay.c
+ * (which links this file directly) instead of guessed:
+ *
+ *   OHMD_RIFT_GAIN_POS=x,y,z   OHMD_RIFT_GAIN_VEL=...   OHMD_RIFT_GAIN_ACCEL=...
+ *
+ * A single value applies to all three axes. Values are logged on first use, so
+ * an A/B can be checked from its own output rather than from memory. */
+static vec3f GAIN_POS = {{ 10, 10, 8 }};
+static vec3f GAIN_VEL = {{ 50, 50, 32 }};
+static vec3f GAIN_ACCEL = {{ 25, 25, 16 }};
+
+static void gain_from_env(const char *name, vec3f *g)
+{
+	const char *e = getenv(name);
+	float v[3];
+	int n;
+
+	if (e == NULL || *e == '\0')
+		return;
+	n = sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]);
+	if (n == 1)
+		v[1] = v[2] = v[0];
+	else if (n != 3) {
+		LOGW("%s=\"%s\" is not a number or x,y,z triple - ignored", name, e);
+		return;
+	}
+	for (int i = 0; i < 3; i++) {
+		if (!(v[i] > 0.0f) || v[i] > 1000.0f) {
+			LOGW("%s: %f out of range (0..1000) - ignored", name, v[i]);
+			return;
+		}
+		g->arr[i] = v[i];
+	}
+}
+
+static void init_gains_once(void)
+{
+	static bool done = false;
+
+	if (done)
+		return;
+	done = true;
+
+	gain_from_env("OHMD_RIFT_GAIN_POS", &GAIN_POS);
+	gain_from_env("OHMD_RIFT_GAIN_VEL", &GAIN_VEL);
+	gain_from_env("OHMD_RIFT_GAIN_ACCEL", &GAIN_ACCEL);
+
+	LOGI("position observer gains pos [%.3g %.3g %.3g] vel [%.3g %.3g %.3g] "
+	     "accel [%.3g %.3g %.3g]",
+	     GAIN_POS.arr[0], GAIN_POS.arr[1], GAIN_POS.arr[2],
+	     GAIN_VEL.arr[0], GAIN_VEL.arr[1], GAIN_VEL.arr[2],
+	     GAIN_ACCEL.arr[0], GAIN_ACCEL.arr[1], GAIN_ACCEL.arr[2]);
+}
 
 /* OVR_SensorFusion.cpp vectorAlignmentRotation(): rotation taking 'from'
  * onto 'to' */
@@ -130,6 +196,7 @@ static void apply_pos_correction(rift_fusion_ovr *f, const vec3f *correction)
 void rift_fusion_ovr_init(rift_fusion_ovr *f, const posef *init_pose, int num_delay_slots)
 {
 	assert(num_delay_slots <= RIFT_FUSION_OVR_MAX_SLOTS);
+	init_gains_once();
 	memset(f, 0, sizeof(*f));
 	f->pose = *init_pose;
 	f->num_slots = num_delay_slots;
