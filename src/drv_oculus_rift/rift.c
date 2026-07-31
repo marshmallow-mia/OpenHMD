@@ -296,6 +296,103 @@ static enum rift_calib_offset_mode calib_offset_mode(void)
 	return mode;
 }
 
+/* Keep the factory matrix's ALIGNMENT, drop its SCALE.
+ *
+ * At rest an accelerometer measures gravity and nothing else, so |accel| must
+ * read 9.8067 - an absolute reference that owes nothing to our own estimates.
+ * It did not. Measured live: 10.0543 m/s^2, +2.52%, steady across four 10 s
+ * windows of ~10000 samples. Reproduced offline on the Oculus runtime's own raw
+ * capture: raw 9.4487, factory offset alone 9.7503 (-0.6%), offset plus matrix
+ * 10.0963 (+3.0%). Every other convention was tried - matrix inverse,
+ * transpose, inverse-transpose, offset before and after, offset added instead
+ * of subtracted - and NONE reaches 9.8067. Offset-only beats all of them.
+ *
+ * The scale constants are not the problem: 1/((1<<20)-1) and 1e-4 both appear
+ * in Rift.dll exactly as packet.c uses them. The layout is not the problem
+ * either - decoding accel and gyro rows interleaved is what yields two
+ * diagonally-dominant matrices; the sequential reading does not.
+ *
+ * What the HMD's matrix actually carries is an 8% scale: singular values
+ * 1.0381 / 1.0219 / 0.9614. Its orthogonal part is near-identity with ~1 deg of
+ * cross-axis alignment. The Touch matrix, from a different source (the radio
+ * JSON), is a clean axis permutation with singular values 0.9990 / 0.9981 /
+ * 0.9950 - a 0.41% spread, i.e. already orthogonal.
+ *
+ * So one rule serves both: take the orthogonal polar factor. The Touch
+ * permutation survives it unchanged (largest element shift 0.005) while the
+ * HMD's spurious scale is removed, taking |accel| from +3.01% to -0.50%.
+ *
+ * Why the scale is there at all is unexplained, and worth revisiting - but it
+ * demonstrably breaks a physical invariant, and a 2.5% error leaves ~0.25 m/s^2
+ * of phantom acceleration present at all times, which the fusion then fights.
+ *
+ * Newton iteration for the polar factor: R <- (R + R^-T)/2 converges
+ * quadratically for a well-conditioned R, which these are.
+ * OHMD_RIFT_NO_CALIB_ORTHO=1 keeps the raw factory matrix for A/B. */
+static bool calib_ortho_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled == -1) {
+		const char *e = getenv("OHMD_RIFT_NO_CALIB_ORTHO");
+		enabled = !(e && e[0] == '1');
+	}
+	return enabled;
+}
+
+static void orthonormalize_calib_matrix(float m[3][3], const char *what)
+{
+	float r[3][3], inv_t[3][3];
+	int iter, i, j;
+	float det, before, after;
+
+	if (!calib_ortho_enabled())
+		return;
+
+	memcpy(r, m, sizeof(r));
+
+	for (iter = 0; iter < 12; iter++) {
+		/* inverse transpose of r */
+		det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+		    - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+		    + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+		if (fabsf(det) < 1e-6f)
+			return;   /* degenerate - leave the matrix alone */
+
+		inv_t[0][0] = (r[1][1] * r[2][2] - r[1][2] * r[2][1]) / det;
+		inv_t[1][0] = (r[0][2] * r[2][1] - r[0][1] * r[2][2]) / det;
+		inv_t[2][0] = (r[0][1] * r[1][2] - r[0][2] * r[1][1]) / det;
+		inv_t[0][1] = (r[1][2] * r[2][0] - r[1][0] * r[2][2]) / det;
+		inv_t[1][1] = (r[0][0] * r[2][2] - r[0][2] * r[2][0]) / det;
+		inv_t[2][1] = (r[0][2] * r[1][0] - r[0][0] * r[1][2]) / det;
+		inv_t[0][2] = (r[1][0] * r[2][1] - r[1][1] * r[2][0]) / det;
+		inv_t[1][2] = (r[0][1] * r[2][0] - r[0][0] * r[2][1]) / det;
+		inv_t[2][2] = (r[0][0] * r[1][1] - r[0][1] * r[1][0]) / det;
+
+		for (i = 0; i < 3; i++) {
+			for (j = 0; j < 3; j++)
+				r[i][j] = 0.5f * (r[i][j] + inv_t[i][j]);
+		}
+	}
+
+	/* Report how much scale was carried, so a headset whose matrix is already
+	 * orthogonal says so rather than looking silently untouched. */
+	before = after = 0.0f;
+	for (i = 0; i < 3; i++) {
+		float lb = 0.0f, la = 0.0f;
+		for (j = 0; j < 3; j++) {
+			lb += m[i][j] * m[i][j];
+			la += r[i][j] * r[i][j];
+		}
+		before += sqrtf(lb);
+		after += sqrtf(la);
+	}
+	LOGI("%s calibration matrix: mean row norm %.4f -> %.4f (scale removed "
+		"%.2f%%)", what, before / 3.0f, after / 3.0f,
+		(before / 3.0f - 1.0f) * 100.0f);
+
+	memcpy(m, r, sizeof(r));
+}
+
 static void apply_imu_calibration(const float mat[3][3], const vec3f *offset,
 	const vec3f *raw, vec3f *out)
 {
@@ -565,6 +662,16 @@ static void handle_touch_controller_message(rift_hmd_t *hmd, uint64_t local_ts,
 		if (rift_touch_get_calibration (hmd->ctx, &hmd->radio, touch->device_num,
 				&touch->calibration) < 0)
 			return;
+
+		/* Same treatment as the HMD. The Touch matrix is an axis permutation
+		 * and already orthogonal to 0.41%, so this leaves it alone - but it
+		 * is the same class of data from the same factory process, and
+		 * treating one device differently from the other is how a discrepancy
+		 * like the HMD's hides. */
+		orthonormalize_calib_matrix(touch->calibration.accel_matrix,
+			touch->device_num == 0 ? "Touch 0 accel" : "Touch 1 accel");
+		orthonormalize_calib_matrix(touch->calibration.gyro_matrix,
+			touch->device_num == 0 ? "Touch 0 gyro" : "Touch 1 gyro");
 
 		quatf imu_orient = {{ 0.0, 0.0, 0.0, 1.0 }};
 		posef imu_pose;
@@ -1504,6 +1611,8 @@ static rift_hmd_t *open_hmd(ohmd_driver* driver, ohmd_device_desc* desc)
 	size = get_feature_report(priv, RIFT_CMD_IMU_CALIBRATION, buf);
 	decode_imu_calibration(&priv->imu_calibration, buf, size);
 	dump_packet_imu_calibration(&priv->imu_calibration);
+	orthonormalize_calib_matrix(priv->imu_calibration.accel_matrix, "HMD accel");
+	orthonormalize_calib_matrix(priv->imu_calibration.gyro_matrix, "HMD gyro");
 
 	// Read and decode display information
 	size = get_feature_report(priv, RIFT_CMD_DISPLAY_INFO, buf);
