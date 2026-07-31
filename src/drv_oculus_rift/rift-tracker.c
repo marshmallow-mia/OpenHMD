@@ -74,7 +74,49 @@
  * bleeds away smoothly (never a visible step). Bleed speeds up while the head
  * is moving, when the eye can't detect it. Offsets larger than the clamps
  * (bad prior / re-acquisition) step through immediately. */
-#define OUT_CORR_TAU 0.3f                    /* bleed time constant, seconds */
+#define OUT_CORR_TAU_DEFAULT 0.1f            /* bleed time constant, seconds */
+
+/* Overridable, because this is the knob on a real trade and it should be swept
+ * against numbers rather than picked. Measured 2026-07-31 on a desk-stationary
+ * headset, within-50ms excursion / slow drift:
+ *
+ *   bleeding OFF   6.501 mm   4.46 mm/min
+ *   bleeding ON    0.318 mm  36.14 mm/min      (tau 0.3 s)
+ *   Oculus runtime 0.042 mm        -
+ *
+ * Bleeding is 20x better on the fast jitter the wearer calls vibration, and
+ * worse on slow wander, because a correction smeared over tau leaves the pose
+ * trailing the vision fix. A shorter tau should move back along that trade.
+ *
+ * Note the comment below claims turning bleeding off costs only 0.023 -> 0.029
+ * mm of "sample-to-sample step". That metric compares ADJACENT samples, so a
+ * correction spread over several of them barely registers - it missed a 20x
+ * effect, in the same way a 0.25 s smoothing window and a 0.03 m/s stillness
+ * threshold each hid a real defect earlier in this investigation. The
+ * within-50ms excursion in tools/jitter_profile.py is the metric that sees it.
+ *
+ *   OHMD_RIFT_OUT_CORR_TAU=<seconds>
+ */
+static float out_corr_tau(void)
+{
+	static float tau = -1.0f;
+
+	if (tau < 0.0f) {
+		const char *e = getenv("OHMD_RIFT_OUT_CORR_TAU");
+		tau = OUT_CORR_TAU_DEFAULT;
+		if (e != NULL && *e != '\0') {
+			float v = (float)atof(e);
+			if (v > 0.005f && v < 5.0f)
+				tau = v;
+			else
+				LOGW("OHMD_RIFT_OUT_CORR_TAU=%s out of range "
+				     "(0.005..5 s) - keeping %.3f", e, tau);
+		}
+		LOGI("output correction bleed tau %.3f s", tau);
+	}
+	return tau;
+}
+#define OUT_CORR_TAU out_corr_tau()
 #define OUT_CORR_ANG_REF 1.0f                /* rad/s of head rotation that doubles the bleed rate */
 #define OUT_CORR_LIN_REF 0.5f                /* m/s of head motion that doubles the bleed rate */
 #define OUT_CORR_MIN_ANG_RATE DEG_TO_RAD(0.5f) /* minimum bleed, rad/s */
@@ -582,16 +624,40 @@ static void extrinsic_refine_measure(rift_tracked_device_priv *dev,
 	}
 }
 
-/* Optical corrections are applied to the displayed pose directly. They used to
- * be bled in over OUT_CORR_TAU instead, to hide the step each one made, and
- * that is now OFF by default -- set OHMD_RIFT_BLEED=1 to restore it.
+/* Optical corrections are bled in over OUT_CORR_TAU rather than stepping the
+ * displayed pose, because stepping them is visible as vibration at the camera
+ * rate. Set OHMD_RIFT_NO_BLEED=1 to step them instead.
  *
- * Bleeding was worth it when corrections were large and noisy. It is not any
+ * This was OFF between f5830f4 and 2026-07-31 on the reasoning preserved below,
+ * which turned out to rest on a metric that could not see the effect. Measured
+ * on a desk-stationary headset, within-50ms excursion (tools/jitter_profile.py)
+ * and slow drift:
+ *
+ *   bleeding OFF        6.501 mm    4.46 mm/min
+ *   bleeding ON tau 0.3 0.318 mm   36.14 mm/min
+ *   bleeding ON tau 0.1 0.394 mm   10.45 mm/min   <- default
+ *   Oculus runtime      0.042 mm          -
+ *
+ * Bleeding is ~16x better on the fast jitter a wearer calls vibration. It costs
+ * slow drift, because a smeared correction leaves the pose trailing the fix,
+ * and tau 0.1 keeps almost all the jitter benefit while cutting that drift 3.5x
+ * against tau 0.3. At tau 0.1 the p95 excursion is 0.912 mm against the Oculus
+ * runtime's 0.759 mm.
+ *
+ * The superseded reasoning, kept because the failure mode is instructive:
+ *
+ * "Bleeding was worth it when corrections were large and noisy. It is not any
  * more: with the joint reconstruction and automatic calibration in place they
  * are small and trustworthy, so smearing one over ~1 s only delays a correct
  * measurement, and does so *while the head is moving* since the rate scales
  * with velocity. Reported in the headset as movement that "translates weirdly"
- * while never vibrating - which is exactly the shape of the trade.
+ * while never vibrating - which is exactly the shape of the trade."
+ *
+ * The numbers backing that were sample-to-sample steps, which compare ADJACENT
+ * samples and therefore barely register a correction spread over several of
+ * them - it read 0.023 -> 0.029 mm where the within-50ms excursion reads
+ * 0.318 -> 6.501 mm. Three separate metrics in this project have now hidden a
+ * real defect by excluding the band it lives in.
  *
  * Measured, stationary, on the output pose: turning it off costs 0.023 -> 0.029
  * mm of sample-to-sample step (max 0.17 -> 0.35 mm) and 0.184 -> 0.236 mm rms
@@ -601,11 +667,11 @@ static bool out_corr_enabled(void)
 {
 	static int enabled = -1;
 	if (enabled == -1) {
-		const char *e = getenv("OHMD_RIFT_BLEED");
-		enabled = (e && e[0] == '1');
+		const char *e = getenv("OHMD_RIFT_NO_BLEED");
+		enabled = !(e && e[0] == '1');
 		LOGI("output correction bleeding %s%s",
 			enabled ? "ON" : "OFF",
-			enabled ? " (OHMD_RIFT_BLEED=1)" : " - set OHMD_RIFT_BLEED=1 to restore");
+			enabled ? "" : " (OHMD_RIFT_NO_BLEED=1)");
 	}
 	return enabled;
 }
